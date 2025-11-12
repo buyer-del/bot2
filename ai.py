@@ -126,7 +126,7 @@ def analyze_task_with_ai(prompt: str, raw_text: str, timeout_sec: int = 20) -> O
     """Викликає Gemini-модель Vertex AI і повертає структуровану відповідь."""
     try:
         vertexai.init(project="task-dispatcher-bot", location="us-central1")
-        model = GenerativeModel("gemini-1.5-flash")
+        model = GenerativeModel("gemini-2.0-flash-001")
 
         system_prompt = (
             prompt
@@ -164,3 +164,4 @@ def analyze_task_with_ai(prompt: str, raw_text: str, timeout_sec: int = 20) -> O
         print("❌ Vertex AI error:", str(e))
         traceback.print_exc()
         return None
+
