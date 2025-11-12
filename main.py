@@ -332,7 +332,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 3) Фолбек: AI недоступний або парсинг не вдався — записуємо як є (в опис)
         try:
-            append_task("Задача", raw_text, "#інше")
+            append_task(raw_text)
             await _remove_old_keyboard(context)
             await q.message.reply_text("⚠️ AI недоступний. Задачу додано як є (в опис).")
             buf.clear()
@@ -392,3 +392,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
