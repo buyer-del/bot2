@@ -9,12 +9,14 @@ import io
 import json
 import subprocess
 import tempfile
+import traceback
 from typing import Optional
 
 from google.cloud import speech_v1 as speech
 from google.cloud import vision
 import vertexai
 from vertexai.generative_models import GenerativeModel, GenerationConfig
+
 
 # -----------------------------
 # Налаштування Google Credentials
@@ -126,9 +128,7 @@ def extract_text_from_image(image_path: str) -> Optional[str]:
 def analyze_task_with_ai(prompt: str, raw_text: str, timeout_sec: int = 20) -> Optional[str]:
     """Викликає Gemini-модель Vertex AI і повертає структуровану відповідь."""
     try:
-        # ✅ Просте ініціалізування Vertex AI
         vertexai.init(project="task-dispatcher-bot", location="us-central1")
-
         model = GenerativeModel("gemini-1.5-flash")
 
         system_prompt = (
@@ -139,7 +139,9 @@ def analyze_task_with_ai(prompt: str, raw_text: str, timeout_sec: int = 20) -> O
         )
 
         generation_config = GenerationConfig(
-            temperature=0.2, top_p=0.9, max_output_tokens=512,
+            temperature=0.2,
+            top_p=0.9,
+            max_output_tokens=512,
         )
 
         parts = [
@@ -148,7 +150,9 @@ def analyze_task_with_ai(prompt: str, raw_text: str, timeout_sec: int = 20) -> O
         ]
 
         resp = model.generate_content(
-            parts, generation_config=generation_config, timeout=timeout_sec,
+            parts,
+            generation_config=generation_config,
+            timeout=timeout_sec,
         )
 
         text = getattr(resp, "text", "").strip()
@@ -161,4 +165,5 @@ def analyze_task_with_ai(prompt: str, raw_text: str, timeout_sec: int = 20) -> O
     except Exception as e:
         # 🔥 Повне логування помилок Vertex AI
         print("❌ Vertex AI error:", str(e))
+        traceback.print_exc()
         return None
