@@ -149,10 +149,10 @@ def analyze_task_with_ai(prompt: str, raw_text: str, timeout_sec: int = 20) -> O
             {"role": "user", "parts": [f"Повідомлення:\n{raw_text}"]},
         ]
 
+        # ✅ Прибрано timeout параметр — не підтримується у поточному SDK
         resp = model.generate_content(
             parts,
-            generation_config=generation_config,
-            timeout=timeout_sec,
+            generation_config=generation_config
         )
 
         text = getattr(resp, "text", "").strip()
@@ -163,7 +163,7 @@ def analyze_task_with_ai(prompt: str, raw_text: str, timeout_sec: int = 20) -> O
         return text
 
     except Exception as e:
-        # 🔥 Повне логування помилок Vertex AI
         print("❌ Vertex AI error:", str(e))
+        import traceback
         traceback.print_exc()
         return None
