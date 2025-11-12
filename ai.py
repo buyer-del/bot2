@@ -36,17 +36,14 @@ def _setup_google_credentials() -> str:
 
 
 _CREDS_PATH = _setup_google_credentials()
-
-# -----------------------------
-# Константи
-# -----------------------------
 SPEECH_LANGUAGE = os.getenv("SPEECH_LANGUAGE", "uk-UA")
+
 
 # -----------------------------
 # Конвертація аудіо → WAV 16kHz mono
 # -----------------------------
 def _convert_to_wav_16k_mono(input_path: str) -> str:
-    """Конвертує будь-яке аудіо/відео у WAV PCM 16-bit, mono, 16000 Hz (через ffmpeg)."""
+    """Конвертує будь-яке аудіо/відео у WAV PCM 16-bit, mono, 16000 Hz."""
     fd, out_path = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
     cmd = [
@@ -144,15 +141,15 @@ def analyze_task_with_ai(prompt: str, raw_text: str, timeout_sec: int = 20) -> O
             max_output_tokens=512,
         )
 
-        parts = [
-            {"role": "user", "parts": [system_prompt]},
-            {"role": "user", "parts": [f"Повідомлення:\n{raw_text}"]},
+        # ✅ Новий формат (SDK 2025): просто список рядків
+        contents = [
+            system_prompt,
+            f"Повідомлення:\n{raw_text}",
         ]
 
-        # ✅ Прибрано timeout параметр — не підтримується у поточному SDK
         resp = model.generate_content(
-            parts,
-            generation_config=generation_config
+            contents,
+            generation_config=generation_config,
         )
 
         text = getattr(resp, "text", "").strip()
@@ -160,10 +157,10 @@ def analyze_task_with_ai(prompt: str, raw_text: str, timeout_sec: int = 20) -> O
             print("⚠️ Vertex AI не повернув текст.")
             return None
 
+        print("✅ Vertex AI відповідь:", text)
         return text
 
     except Exception as e:
         print("❌ Vertex AI error:", str(e))
-        import traceback
         traceback.print_exc()
         return None
