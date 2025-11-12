@@ -1,5 +1,6 @@
 import os
 import json
+from datetime import datetime
 from typing import List
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
@@ -10,7 +11,7 @@ from google.oauth2.service_account import Credentials
 
 def _get_credentials():
     """
-    Отримує облікові дані з GOOGLE_CREDENTIALS_JSON (як у інших модулях).
+    Отримує облікові дані з GOOGLE_CREDENTIALS_JSON.
     """
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if not creds_json:
@@ -23,9 +24,9 @@ _SPREADSHEET_ID = os.environ.get("SHEETS_SPREADSHEET_ID")
 if not _SPREADSHEET_ID:
     raise RuntimeError("SHEETS_SPREADSHEET_ID не задано")
 
-# Діапазони за замовчуванням
-_RANGE_STRUCTURED = os.environ.get("SHEETS_RANGE_STRUCTURED", "Tasks!A:E")  # 5 колонок
-_RANGE_LEGACY = os.environ.get("SHEETS_RANGE_LEGACY", "Tasks!A:C")         # 3 колонки (сумісність)
+# Діапазони
+_RANGE_STRUCTURED = os.environ.get("SHEETS_RANGE_STRUCTURED", "Tasks!A:F")  # 6 колонок (час + 5 полів)
+_RANGE_FALLBACK = os.environ.get("SHEETS_RANGE_FALLBACK", "Tasks!A:F")
 
 def _append_values(range_a1: str, values: List[List[str]]):
     creds = _get_credentials()
@@ -40,25 +41,30 @@ def _append_values(range_a1: str, values: List[List[str]]):
     ).execute()
 
 # =========================
-# Старий інтерфейс (сумісність)
+# Запис fallback (AI недоступний)
 # =========================
-def append_task(title: str, description: str, tag: str):
+def append_task(raw_description: str):
     """
-    Старий варіант: 3 колонки.
-    Не чіпаємо для сумісності з існуючими місцями виклику.
+    Коли AI недоступний — записує лише час і опис.
+    Інші стовпці залишаються порожні.
     """
-    _append_values(_RANGE_LEGACY, [[title, description, tag]])
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = [ts, "", "", "", "", raw_description]
+    _append_values(_RANGE_FALLBACK, [row])
 
 # =========================
-# Новий інтерфейс (5 колонок, S2)
+# Запис структурованих задач (AI)
 # =========================
 def append_task_structured(name: str, tag: str, deadline: str, priority: str, description: str):
     """
-    Новий варіант: запис у 5 колонок:
-      A: Назва
-      B: Тег
-      C: Дедлайн
-      D: Пріоритет
-      E: Опис
+    Новий варіант: запис у 6 колонок:
+      A: Час
+      B: Назва
+      C: Тег
+      D: Дедлайн
+      E: Пріоритет
+      F: Опис
     """
-    _append_values(_RANGE_STRUCTURED, [[name, tag, deadline, priority, description]])
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = [ts, name, tag, deadline, priority, description]
+    _append_values(_RANGE_STRUCTURED, [row])
