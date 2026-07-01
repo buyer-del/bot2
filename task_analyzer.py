@@ -123,7 +123,7 @@ def analyze_day(
         contents=user_content,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=4000,
+            max_output_tokens=8000,
         ),
     )
 
