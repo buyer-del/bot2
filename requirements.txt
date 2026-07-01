@@ -1,12 +1,4 @@
-python-telegram-bot[webhooks]==20.3
-google-cloud-speech
-google-cloud-vision
-google-api-python-client
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-pydub
+python-telegram-bot[webhooks]==22.8
 flask
-google-cloud-aiplatform>=1.66.0
-
-
+google-genai
+httpx==0.28.1
