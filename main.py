@@ -1,7 +1,20 @@
+"""
+Telegram-бот: щоденний аналіз робочого логу (chats/emails/calls) →
+виявлення нових завдань і оновлень статусу існуючих →
+послідовне підтвердження користувачем → запис у сховище.
+
+Архітектура — див. документ "Архітектура_системи_завдань.md".
+Webhook-інфраструктура (Flask + python-telegram-bot, окремий asyncio loop)
+збережена з попередньої версії бота (репозиторій buyer-del/bot2) без змін,
+оскільки вона вже надійно працює на Render.
+"""
+
 import os
+import json
 import logging
 import asyncio
 import threading
+
 from flask import Flask, request
 from telegram import (
     Update,
@@ -18,8 +31,10 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest
 
-from ai import transcribe_audio, extract_text_from_image, analyze_task_with_ai
-from sheets_api import append_task, append_task_structured
+from log_filter import filter_log
+from task_analyzer import analyze_day, load_projects
+from report import generate_report
+import storage
 
 # =========================
 # ЛОГИ
@@ -33,322 +48,401 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://.../
 PORT = int(os.getenv("PORT", 10000))
+PROJECTS_FILE = os.getenv("PROJECTS_FILE", "projects.json")
+CONTACTS_FILE = os.getenv("CONTACTS_FILE", "contacts.json")
 
 if not TOKEN:
     raise SystemExit("TELEGRAM_BOT_TOKEN не задано")
 if not WEBHOOK_URL or not WEBHOOK_URL.startswith("https://"):
     raise SystemExit("WEBHOOK_URL не задано або не HTTPS")
 
-MAX_BUFFER_ITEMS = 3
-
 # =========================
 # Flask
 # =========================
 flask_app = Flask(__name__)
 
+
 @flask_app.route("/", methods=["GET", "HEAD"])
 def root():
     return "ok", 200
+
 
 # =========================
 # Telegram Application
 # =========================
 bot_app = Application.builder().token(TOKEN).build()
 
-# -------------------------
-# ДОПОМІЖНЕ
-# -------------------------
-def _buf(context: ContextTypes.DEFAULT_TYPE):
-    return context.user_data.setdefault("buffer", [])
 
-def _kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📌 Створити задачу", callback_data="new_task")],
-        [InlineKeyboardButton("🧹 Очистити", callback_data="clear_buf")],
-    ])
+# -------------------------
+# ДОПОМІЖНЕ: керування чергою підтверджень
+# -------------------------
+def _queue(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
+    """Черга елементів, що очікують підтвердження користувача (проєкти, потім завдання)."""
+    return context.user_data.setdefault("confirm_queue", [])
+
+
+def _pending(context: ContextTypes.DEFAULT_TYPE) -> dict | None:
+    return context.user_data.get("pending_item")
+
 
 async def _remove_old_keyboard(context: ContextTypes.DEFAULT_TYPE):
-    """Прибирає кнопки із попереднього бот-повідомлення."""
     chat_id = context.user_data.get("last_kb_chat_id")
     msg_id = context.user_data.get("last_kb_message_id")
     if not chat_id or not msg_id:
         return
     try:
-        await context.bot.edit_message_reply_markup(
-            chat_id=chat_id,
-            message_id=msg_id,
-            reply_markup=None
-        )
+        await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=None)
     except BadRequest:
         pass
     except Exception as e:
         logger.exception("Не вдалося прибрати старі кнопки: %s", e)
 
-def _buffer_has_space(context: ContextTypes.DEFAULT_TYPE):
-    return len(_buf(context)) < MAX_BUFFER_ITEMS
 
-async def _post_text_with_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Надсилає повідомлення з текстом + кнопками, прибираючи попередні."""
+async def _send_with_keyboard(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, keyboard: InlineKeyboardMarkup):
     await _remove_old_keyboard(context)
-    sent = await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=text,
-        reply_markup=_kb()
-    )
+    sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
     context.user_data["last_kb_chat_id"] = sent.chat_id
     context.user_data["last_kb_message_id"] = sent.message_id
 
+
 # -------------------------
-# ПАРСИНГ ВІДПОВІДІ AI (S2)
+# ФОРМУВАННЯ ЧЕРГИ ПІДТВЕРДЖЕНЬ (Крок 4 архітектури)
 # -------------------------
-def _parse_ai_structured_text(s: str):
+def _build_confirm_queue(analysis: dict) -> list[dict]:
     """
-    Очікує формат:
-      Назва: ...
-      Тег: ...
-      Дедлайн: ...
-      Пріоритет: ...
-      Опис: ...
-
-    Повертає dict або None, якщо щось критично не заповнено.
+    Перетворює результат analyze_day() на чергу елементів для послідовного
+    підтвердження: спочатку всі кандидати на нові проєкти (мають бути
+    зафіксовані остаточно до запису завдань, Розділ 5-6), а ПОТІМ нові
+    завдання й оновлення статусу ЧЕРГУЮТЬСЯ між собою — щоб оновлення
+    статусу не губились у кінці довгого списку нових завдань.
     """
-    if not s:
-        return None
+    queue = []
 
-    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
-    fields = {"name": "", "tag": "", "deadline": "", "priority": "", "description": ""}
+    new_tasks = analysis.get("new_tasks", [])
+    task_updates = analysis.get("task_updates", [])
 
-    def take(prefix):
-        for ln in lines:
-            low = ln.lower()
-            if low.startswith(prefix.lower()):
-                return ln[len(prefix):].strip()
-        return ""
+    for t in new_tasks:
+        if not t.get("project_id"):
+            queue.append({"type": "new_project_candidate", "payload": t})
 
-    fields["name"] = take("Назва:")
-    fields["tag"] = take("Тег:")
-    fields["deadline"] = take("Дедлайн:")
-    fields["priority"] = take("Пріоритет:")
-    # опис може бути багаторядковим; якщо модель дала в один рядок — теж ок
-    desc_start = None
-    for idx, ln in enumerate(lines):
-        if ln.lower().startswith("опис:"):
-            desc_start = idx
-            break
-    if desc_start is not None:
-        first = lines[desc_start][len("Опис:"):].strip()
-        rest = lines[desc_start + 1 :]
-        fields["description"] = ("\n".join([first] + rest)).strip()
+    new_task_items = [{"type": "new_task", "payload": t} for t in new_tasks]
+    update_items = [{"type": "task_update", "payload": u} for u in task_updates]
+
+    # Чергування (round-robin), щоб обидва типи були рівномірно представлені в черзі
+    max_len = max(len(new_task_items), len(update_items))
+    for i in range(max_len):
+        if i < len(new_task_items):
+            queue.append(new_task_items[i])
+        if i < len(update_items):
+            queue.append(update_items[i])
+
+    return queue
+
+
+def _kb_new_project(payload: dict) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Прийняти", callback_data="np_accept")],
+        [InlineKeyboardButton("✏️ Виправити назву", callback_data="np_edit")],
+        [InlineKeyboardButton("🔗 Це вже існуючий проєкт", callback_data="np_link")],
+        [InlineKeyboardButton("❌ Відхилити", callback_data="np_reject")],
+    ])
+
+
+def _kb_new_task() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Додати завдання", callback_data="nt_accept")],
+        [InlineKeyboardButton("❌ Відхилити", callback_data="nt_reject")],
+    ])
+
+
+def _kb_task_update() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Підтвердити оновлення", callback_data="tu_accept")],
+        [InlineKeyboardButton("❌ Відхилити", callback_data="tu_reject")],
+    ])
+
+
+def _kb_project_list(projects: list[dict]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(p["full_name"], callback_data=f"np_link_pick_{p['id']}")]
+        for p in projects
+    ]
+    rows.append([InlineKeyboardButton("« Назад", callback_data="np_link_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _present_next(update_or_chat_id, context: ContextTypes.DEFAULT_TYPE):
+    """Бере наступний елемент черги і показує його користувачу на підтвердження."""
+    queue = _queue(context)
+
+    if isinstance(update_or_chat_id, int):
+        chat_id = update_or_chat_id
     else:
-        fields["description"] = take("Опис:")
+        chat_id = update_or_chat_id.effective_chat.id
 
-    # Нормалізація
-    if not fields["name"]:
-        return None
-    tag = fields["tag"] or "#інше"
-    if tag and not tag.startswith("#"):
-        tag = f"#{tag}"
-    fields["tag"] = tag
-    fields["deadline"] = fields["deadline"] or "не вказано"
+    if not queue:
+        context.user_data["pending_item"] = None
 
-    pr = (fields["priority"] or "").lower()
-    if "висок" in pr:
-        fields["priority"] = "високий"
-    elif "сер" in pr:
-        fields["priority"] = "середній"
-    elif "звич" in pr or not pr:
-        fields["priority"] = "звичайний"
-    else:
-        fields["priority"] = "звичайний"
+        report_messages = context.user_data.get("report_messages")
+        report_date = context.user_data.get("report_date", "")
 
-    if not fields["description"]:
-        fields["description"] = "(без опису)"
+        if report_messages is not None:
+            await context.bot.send_message(chat_id=chat_id, text="✅ Усі пропозиції за сьогодні опрацьовано.\n📝 Складаю звіт за день…")
+            try:
+                report_text = await asyncio.to_thread(generate_report, report_messages, report_date)
+                await context.bot.send_message(chat_id=chat_id, text=report_text)
+            except Exception as e:
+                logger.exception("Помилка генерації звіту: %s", e)
+                await context.bot.send_message(chat_id=chat_id, text=f"❌ Не вдалося згенерувати звіт: {e}")
+            finally:
+                context.user_data["report_messages"] = None
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="✅ Усі пропозиції за сьогодні опрацьовано.")
+        return
 
-    return fields
+    item = queue.pop(0)
+    context.user_data["pending_item"] = item
+    payload = item["payload"]
+
+    if item["type"] == "new_project_candidate":
+        text = (
+            f"🆕 Схоже на новий проєкт.\n\n"
+            f"Запропонована назва: {payload.get('title', '(не вказано)')}\n"
+            f"Джерело: \"{payload.get('source_text', '')}\"\n"
+            f"Від: {payload.get('source_sender', '')}\n"
+            f"Причина: {payload.get('reasoning', '')}"
+        )
+        await _send_with_keyboard(context, chat_id, text, _kb_new_project(payload))
+
+    elif item["type"] == "new_task":
+        proj = payload.get("project_id") or "не визначено"
+        text = (
+            f"📌 Нове завдання:\n\n"
+            f"{payload.get('title')}\n"
+            f"Проєкт: {proj}\n"
+            f"Джерело: \"{payload.get('source_text', '')}\"\n"
+            f"Від: {payload.get('source_sender', '')}"
+        )
+        await _send_with_keyboard(context, chat_id, text, _kb_new_task())
+
+    elif item["type"] == "task_update":
+        task = storage.get_task_by_id(int(payload["task_id"])) if str(payload.get("task_id", "")).isdigit() else None
+        task_title = task["title"] if task else f"id={payload.get('task_id')}"
+        text = (
+            f"🔄 Оновлення статусу:\n\n"
+            f"Завдання: {task_title}\n"
+            f"Новий статус: {payload.get('new_status')}\n"
+            f"Коментар: {payload.get('comment', '')}\n"
+            f"Джерело: \"{payload.get('source_text', '')}\"\n"
+            f"Від: {payload.get('source_sender', '')}"
+        )
+        await _send_with_keyboard(context, chat_id, text, _kb_task_update())
+
 
 # -------------------------
 # КОМАНДИ
 # -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот працює. Надішли текст, фото або голос — усе буде розпізнано.")
-    await _post_text_with_keyboard(update, context, "Чорнетка порожня. Додавайте записи повідомленнями.")
+    await update.message.reply_text(
+        "Бот готовий. Надішли JSON-файл логу (кнопка 'поділитися' з додатку логування), "
+        "і я проаналізую день — знайду нові завдання та оновлення статусу."
+    )
+
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
 
-# -------------------------
-# ТЕКСТ
-# -------------------------
-async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if not text:
-        await update.message.reply_text("❌ Порожній текст.")
-        return
-    if not _buffer_has_space(context):
-        await update.message.reply_text("⚠️ Чернетка заповнена (3/3).")
-        return
-    _buf(context).append(text)
-    await update.message.reply_text("✅ Додано в чернетку")
-    await _post_text_with_keyboard(update, context, text)
 
 # -------------------------
-# ФОТО
+# ПРИЙОМ ЛОГУ (JSON-файл)
 # -------------------------
-async def photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def log_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    doc = update.message.document
+    if not doc.file_name.endswith(".json"):
+        return  # не наш файл — ігноруємо мовчки (можливо документ-аудіо обробляється іншим хендлером)
+
+    await update.message.reply_text("📥 Лог отримано, аналізую день…")
+
     try:
-        file = await update.message.photo[-1].get_file()
-        local_path = "photo.jpg"
+        file = await doc.get_file()
+        local_path = "incoming_log.json"
         await file.download_to_drive(local_path)
-        recognized = (extract_text_from_image(local_path) or "").strip()
-        if not recognized:
-            await update.message.reply_text("❌ Нічого не розпізнано.")
-            return
-        if not _buffer_has_space(context):
-            await update.message.reply_text("⚠️ Чернетка заповнена (3/3).")
-            return
-        _buf(context).append(recognized)
-        await update.message.reply_text("🖼 Розпізнано текст")
-        await _post_text_with_keyboard(update, context, recognized)
+
+        with open(local_path, "r", encoding="utf-8") as f:
+            log_data = json.load(f)
+
+        filtered = filter_log(log_data, CONTACTS_FILE)
+        projects = load_projects(PROJECTS_FILE) if os.path.exists(PROJECTS_FILE) else storage.get_projects()
+        open_tasks = storage.get_open_tasks()
+
+        analysis = await asyncio.to_thread(
+            analyze_day,
+            filtered["branch_a_new_tasks"],
+            filtered["branch_b_status_updates"],
+            projects,
+            open_tasks,
+        )
+
+        queue = _build_confirm_queue(analysis)
+        context.user_data["confirm_queue"] = queue
+
+        # Зберігаємо дані для звіту (Крок 6) — викличеться після завершення
+        # підтвердження всіх пропозицій (Крок 4-5).
+        context.user_data["report_messages"] = filtered["branch_b_status_updates"]
+        context.user_data["report_date"] = log_data.get("export_date", "")
+
+        n_new = len(analysis.get("new_tasks", []))
+        n_upd = len(analysis.get("task_updates", []))
+        await update.message.reply_text(
+            f"Готово. Знайдено: {n_new} нових завдань, {n_upd} оновлень статусу.\nПочинаю підтвердження…"
+        )
+
+        await _present_next(update, context)
+
     except Exception as e:
-        logger.exception("Помилка OCR: %s", e)
-        await update.message.reply_text("❌ Помилка розпізнавання фото.")
+        logger.exception("Помилка обробки логу: %s", e)
+        await update.message.reply_text(f"❌ Помилка обробки логу: {e}")
+
 
 # -------------------------
-# ГОЛОС (voice)
+# КНОПКИ (Крок 4 — послідовне підтвердження)
 # -------------------------
-async def voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        file = await update.message.voice.get_file()
-        local_path = "voice.ogg"
-        await file.download_to_drive(local_path)
-        recognized = (transcribe_audio(local_path) or "").strip()
-        if not recognized:
-            await update.message.reply_text("❌ Голос не розпізнано.")
-            return
-        if not _buffer_has_space(context):
-            await update.message.reply_text("⚠️ Чернетка заповнена (3/3).")
-            return
-        _buf(context).append(recognized)
-        await update.message.reply_text("🎤 Розпізнано текст")
-        await _post_text_with_keyboard(update, context, recognized)
-    except Exception as e:
-        logger.exception("Помилка голосу: %s", e)
-        await update.message.reply_text("❌ Помилка розпізнавання голосу.")
-
-# -------------------------
-# АУДІО-ФАЙЛИ (m4a/mp3/wav як документ)
-# -------------------------
-async def audio_document_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        file = await update.message.document.get_file()
-        orig_name = update.message.document.file_name or "audio"
-        local_path = f"input_{orig_name}"
-        await file.download_to_drive(local_path)
-        recognized = (transcribe_audio(local_path) or "").strip()
-        if not recognized:
-            await update.message.reply_text("❌ Не вдалося розпізнати аудіо-файл.")
-            return
-        if not _buffer_has_space(context):
-            await update.message.reply_text("⚠️ Чернетка заповнена (3/3).")
-            return
-        _buf(context).append(recognized)
-        await update.message.reply_text("🎧 Розпізнано текст з файлу")
-        await _post_text_with_keyboard(update, context, recognized)
-    except Exception as e:
-        logger.exception("Помилка розпізнавання аудіо-файлу: %s", e)
-        await update.message.reply_text("❌ Помилка розпізнавання аудіо-файлу.")
-
-# -------------------------
-# КНОПКИ
-# -------------------------
-AI_PROMPT = (
-    "Ти — аналітик задач у виробничій команді.\n"
-    "Отримуєш короткі або неформальні повідомлення українською.\n"
-    "У текстах можуть бути зайві слова, жаргон, повтори чи імена людей — їх потрібно ігнорувати.\n"
-    "Залишай лише суттєву, змістовну інформацію, зрозумілу людині.\n\n"
-    "На основі повідомлення потрібно створити структурований опис із такими полями:\n\n"
-    "1. Назва — коротко і змістовно описує суть дії (наприклад, \"Закупівля метизу\", \"Перевірка освітлення\", \"Ремонт дверей\").\n"
-    "   У назві не використовуй номери об’єктів чи теги.\n"
-    "2. Тег — якщо у тексті є номер ліфта або об’єкта (наприклад, 246), зроби його тегом у форматі #246.\n"
-    "   Якщо номер відсутній, встанови тег #інше.\n"
-    "3. Дедлайн — якщо дата або термін не згадані, пиши \"не вказано\".\n"
-    "4. Пріоритет — оцінюй рівень терміновості за змістом повідомлення:\n"
-    "   якщо згадано \"терміново\", \"негайно\", \"сьогодні\", \"зараз\" — вкажи \"високий\",\n"
-    "   якщо \"цього тижня\", \"до кінця тижня\" — \"середній\",\n"
-    "   інакше — \"звичайний\".\n"
-    "5. Опис — сформулюй коротку інструкцію, яка пояснює, що потрібно зробити, без зайвих деталей і повторів.\n\n"
-    "Формат відповіді строго такий:\n"
-    "Назва: ...\n"
-    "Тег: ...\n"
-    "Дедлайн: ...\n"
-    "Пріоритет: ...\n"
-    "Опис: ..."
-)
-
 async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     data = q.data
-    buf = _buf(context)
+    await q.answer()
 
-    if data == "clear_buf":
-        buf.clear()
+    item = _pending(context)
+    if not item:
+        await q.message.reply_text("Немає активної пропозиції для підтвердження.")
+        return
+
+    payload = item["payload"]
+
+    # --- Новий проєкт: прийняти як є ---
+    if data == "np_accept":
+        projects = storage.get_projects()
+        new_id = payload.get("title")
+        projects.append({"id": new_id, "short_number": "", "full_name": payload.get("title")})
+        storage.set_projects(projects)
         await _remove_old_keyboard(context)
-        await q.message.reply_text("🧹 Чернетку очищено.")
+        await q.message.reply_text(f"✅ Новий проєкт додано: {payload.get('title')}")
+        await _present_next(update, context)
         return
 
-    if data == "new_task":
-        if not buf:
-            await q.message.reply_text("⚠️ Чернетка порожня.")
+    # --- Новий проєкт: виправити назву (запит тексту) ---
+    if data == "np_edit":
+        context.user_data["awaiting_project_name_edit"] = True
+        await q.message.reply_text("Напиши правильну назву проєкту звичайним повідомленням:")
+        return
+
+    # --- Новий проєкт: це вже існуючий — показати список ---
+    if data == "np_link":
+        projects = storage.get_projects()
+        if not projects:
+            await q.message.reply_text("Список наявних проєктів порожній.")
             return
-
-        raw_text = "\n".join(buf)
-
-        # 1) Викликаємо AI (Vertex) у бекграунді, щоб не блокувати
-        try:
-            structured_text = await asyncio.to_thread(analyze_task_with_ai, AI_PROMPT, raw_text)
-        except Exception as e:
-            logger.exception("AI exception: %s", e)
-            structured_text = None
-
-        # 2) Якщо є структурований результат — парсимо і пишемо 5 колонок
-        if structured_text:
-            fields = _parse_ai_structured_text(structured_text)
-            if fields:
-                try:
-                    append_task_structured(
-                        fields["name"],
-                        fields["tag"],
-                        fields["deadline"],
-                        fields["priority"],
-                        fields["description"],
-                    )
-                    await _remove_old_keyboard(context)
-                    await q.message.reply_text("✅ Задачу структуровано й додано в таблицю:\n\n" + structured_text)
-                    buf.clear()
-                    return
-                except Exception as e:
-                    logger.exception("Помилка запису структури у таблицю: %s", e)
-                    # падати не будемо — перейдемо до фолбек-запису як є
-
-        # 3) Фолбек: AI недоступний або парсинг не вдався — записуємо як є (в опис)
-        try:
-            append_task(raw_text)
-            await _remove_old_keyboard(context)
-            await q.message.reply_text("⚠️ AI недоступний. Задачу додано як є (в опис).")
-            buf.clear()
-        except Exception as e:
-            logger.exception("Помилка фолбек-запису у таблицю: %s", e)
-            await q.message.reply_text("❌ Помилка запису у таблицю.")
+        await _remove_old_keyboard(context)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Обери, до якого проєкту відноситься:",
+            reply_markup=_kb_project_list(projects),
+        )
         return
+
+    if data.startswith("np_link_pick_"):
+        picked_id = data[len("np_link_pick_"):]
+        # Завдання, що чекало на новий проєкт, тепер прив'язується до обраного
+        for qitem in _queue(context):
+            if qitem["type"] == "new_task" and qitem["payload"].get("title") == payload.get("title"):
+                qitem["payload"]["project_id"] = picked_id
+        await _remove_old_keyboard(context)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🔗 Прив'язано до проєкту {picked_id}")
+        await _present_next(update, context)
+        return
+
+    if data == "np_link_cancel":
+        await _present_next(update, context)
+        return
+
+    # --- Новий проєкт: відхилити ---
+    if data == "np_reject":
+        await _remove_old_keyboard(context)
+        await q.message.reply_text("❌ Відхилено.")
+        await _present_next(update, context)
+        return
+
+    # --- Нове завдання: прийняти ---
+    if data == "nt_accept":
+        storage.add_task(
+            title=payload.get("title"),
+            project_id=payload.get("project_id"),
+            source_text=payload.get("source_text", ""),
+            source_sender=payload.get("source_sender", ""),
+        )
+        await _remove_old_keyboard(context)
+        await q.message.reply_text(f"✅ Завдання додано: {payload.get('title')}")
+        await _present_next(update, context)
+        return
+
+    if data == "nt_reject":
+        await _remove_old_keyboard(context)
+        await q.message.reply_text("❌ Відхилено.")
+        await _present_next(update, context)
+        return
+
+    # --- Оновлення статусу: підтвердити ---
+    if data == "tu_accept":
+        task_id = payload.get("task_id")
+        if str(task_id).isdigit():
+            storage.update_task_status(int(task_id), payload.get("new_status", "in_progress"), payload.get("comment", ""))
+        await _remove_old_keyboard(context)
+        await q.message.reply_text("✅ Статус оновлено.")
+        await _present_next(update, context)
+        return
+
+    if data == "tu_reject":
+        await _remove_old_keyboard(context)
+        await q.message.reply_text("❌ Відхилено.")
+        await _present_next(update, context)
+        return
+
+
+# -------------------------
+# ТЕКСТ (використовується для введення нової назви проєкту)
+# -------------------------
+async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting_project_name_edit"):
+        new_name = (update.message.text or "").strip()
+        context.user_data["awaiting_project_name_edit"] = False
+
+        item = _pending(context)
+        if item:
+            projects = storage.get_projects()
+            new_id = new_name
+            projects.append({"id": new_id, "short_number": "", "full_name": new_name})
+            storage.set_projects(projects)
+            await update.message.reply_text(f"✅ Проєкт додано з назвою: {new_name}")
+            await _present_next(update, context)
+        return
+
+    # Поза сценарієм підтвердження — текст просто ігнорується (бот не приймає довільні
+    # повідомлення для аналізу; лог надсилається тільки файлом).
+    await update.message.reply_text(
+        "Надішли JSON-файл логу командою 'поділитися' з додатку логування."
+    )
+
 
 # =========================
 # ASYNC LOOP
 # =========================
 ASYNC_LOOP = asyncio.new_event_loop()
 
+
 def _run_loop_forever(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
+
 
 # =========================
 # WEBHOOK
@@ -358,14 +452,11 @@ def webhook():
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, bot_app.bot)
-        asyncio.run_coroutine_threadsafe(
-            bot_app.process_update(update),
-            ASYNC_LOOP
-        )
+        asyncio.run_coroutine_threadsafe(bot_app.process_update(update), ASYNC_LOOP)
     except Exception as e:
         logger.error("Webhook error", exc_info=e)
-
     return "ok"
+
 
 # =========================
 # ЗАПУСК
@@ -373,23 +464,19 @@ def webhook():
 def main():
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("ping", ping))
+    bot_app.add_handler(MessageHandler(filters.Document.FileExtension("json"), log_document_message))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
-    bot_app.add_handler(MessageHandler(filters.PHOTO, photo_message))
-    bot_app.add_handler(MessageHandler(filters.VOICE, voice_message))
-    bot_app.add_handler(MessageHandler(filters.Document.AUDIO, audio_document_message))
     bot_app.add_handler(CallbackQueryHandler(buttons))
 
     threading.Thread(target=_run_loop_forever, args=(ASYNC_LOOP,), daemon=True).start()
+
     asyncio.run_coroutine_threadsafe(bot_app.initialize(), ASYNC_LOOP).result()
     asyncio.run_coroutine_threadsafe(bot_app.start(), ASYNC_LOOP).result()
-    asyncio.run_coroutine_threadsafe(
-        bot_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook"),
-        ASYNC_LOOP
-    ).result()
+    asyncio.run_coroutine_threadsafe(bot_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook"), ASYNC_LOOP).result()
 
     logger.info("✅ PTB запущено; вебхук: %s/webhook", WEBHOOK_URL)
     flask_app.run(host="0.0.0.0", port=PORT)
 
+
 if __name__ == "__main__":
     main()
-
