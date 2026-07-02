@@ -34,6 +34,28 @@ def _clean_email_signature(text: str) -> str:
     return text[:cut_at].strip()
 
 
+def _parse_group_message(chat_name: str, sender: str, text: str) -> tuple[str, str]:
+    """
+    У групових чатах Telegram поле sender = назва групи, а реальне ім'я
+    відправника йде першим рядком у text, після якого з нового рядка — сам текст.
+
+    Наприклад:
+      sender = "ЦЕХ"
+      text   = "Шеф Андрій Петрович Скайліфт Бережний\nДуже схоже на то"
+
+    Якщо sender збігається з chat_name — це ознака групового формату.
+    Повертає (real_sender, clean_text).
+    """
+    if sender and chat_name and _normalize(sender) == _normalize(chat_name):
+        lines = text.split("\n", 1)
+        if len(lines) == 2:
+            real_sender = lines[0].strip()
+            clean_text = lines[1].strip()
+            if real_sender:
+                return real_sender, clean_text
+    return sender, text
+
+
 def _normalize(value: str) -> str:
     """Нормалізація рядка для порівняння (без зайвих пробілів, у нижньому регістрі)."""
     return (value or "").strip().lower()
@@ -95,15 +117,27 @@ def collect_all_messages(log_data: dict) -> list[dict]:
             if not m.get("text"):
                 continue
 
+            raw_sender = m.get("sender", "")
+            raw_text = m.get("text", "")
+
+            # Для групових чатів: витягуємо реального відправника з першого рядка тексту
+            real_sender, clean_text = _parse_group_message(chat_name, raw_sender, raw_text)
+
+            # Власне повідомлення: або "Я (Ви)" в оригінальному sender, або після розпарсингу групи
+            is_own = raw_sender == "Я (Ви)" or real_sender == "Я (Ви)" or m.get("direction") == "outgoing"
+
+            # Зберігаємо реального відправника в raw для подальшої перевірки is_allowed_sender
+            enriched_raw = {**m, "sender": real_sender}
+
             unified.append({
                 "source": "chat",
                 "platform": platform,
                 "chat_name": chat_name,
-                "sender": m.get("sender"),
-                "is_own": _is_own_message(m),
+                "sender": real_sender,
+                "is_own": is_own,
                 "time": m.get("time"),
-                "text": m.get("text"),
-                "raw": m,
+                "text": clean_text,
+                "raw": enriched_raw,
             })
 
     for e in log_data.get("emails", []):
