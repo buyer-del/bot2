@@ -1,6 +1,76 @@
 {
-  "_comment": "Тестовий список 'дозволених' контактів (ставлять нові завдання). Один запис на людину, кілька варіантів ідентифікації, бо та сама людина в різних каналах фігурує по-різному.",
+  "_comment": "Список 'дозволених' контактів — людей, чиї повідомлення аналізуються на наявність нових завдань (Гілка А). Збіг по будь-якому одному полю (ім'я / телефон / email) зараховує відправника як дозволеного.",
   "contacts": [
+    {
+      "id": "myself",
+      "display_name": "Мій особистий",
+      "names": ["Мій особистий"],
+      "phones": ["+380674553151"],
+      "emails": []
+    },
+    {
+      "id": "vanya_tehnyk",
+      "display_name": "Ваня Технік",
+      "names": ["Ваня Технік обслуга ліфтів"],
+      "phones": ["+380505025955"],
+      "emails": []
+    },
+    {
+      "id": "vodiy_mykola",
+      "display_name": "Водій Микола",
+      "names": ["Водій Скайліфт", "Микола Павлович"],
+      "phones": ["+380677603649"],
+      "emails": []
+    },
+    {
+      "id": "zhenya_tseh",
+      "display_name": "Женя з цеха",
+      "names": ["Женя з цеха"],
+      "phones": ["+380634900499"],
+      "emails": []
+    },
+    {
+      "id": "ihor_konstruktor",
+      "display_name": "Ігор Чорний конструктор",
+      "names": ["Ігор Чорний конструктор"],
+      "phones": ["+380631338655"],
+      "emails": ["chorniy.igr@gmail.com"]
+    },
+    {
+      "id": "lyuba_buhgalter",
+      "display_name": "Люба Бухгалтер",
+      "names": ["Люба Бухгалтер Скайліфт"],
+      "phones": ["+380508168979"],
+      "emails": ["lyubov.sheremet@skylift-group.com"]
+    },
+    {
+      "id": "robochyi_tseh",
+      "display_name": "Робочий телефон цеха",
+      "names": ["Робочий телефон цеха"],
+      "phones": ["+380670069197"],
+      "emails": ["skylift.store@gmail.com"]
+    },
+    {
+      "id": "svitlana",
+      "display_name": "Світлана Скайліфт",
+      "names": ["Світлана Скайліфт"],
+      "phones": ["+380675033730"],
+      "emails": []
+    },
+    {
+      "id": "serhiy_konstruktor",
+      "display_name": "Сергій Завертайло конструктор",
+      "names": ["Сергій Завертайло Конструктор", "Сергій Конструктор"],
+      "phones": ["+380969978343"],
+      "emails": ["zavertaylo1989@gmail.com"]
+    },
+    {
+      "id": "serhiy_tehnyk",
+      "display_name": "Сергій технік",
+      "names": ["Сергій технік Скайліфт"],
+      "phones": ["+380964039571"],
+      "emails": ["serggoserggo@gmail.com"]
+    },
     {
       "id": "shef",
       "display_name": "Шеф (Андрій Бережний)",
@@ -8,12 +78,22 @@
         "Шеф Андрій Петрович Скайліфт Бережний",
         "Andrii Berezhnyi"
       ],
-      "phones": [
-        "+380671307297"
-      ],
-      "emails": [
-        "andrii.berezhnyi@skylift-group.com"
-      ]
+      "phones": ["+380671307297"],
+      "emails": ["andrii.berezhnyi@skylift-group.com"]
+    },
+    {
+      "id": "yulya",
+      "display_name": "Юля Скайліфт",
+      "names": ["Юля Скайліфт"],
+      "phones": ["+380673370880", "+380673370465"],
+      "emails": ["assistant@skylift-group.com"]
+    },
+    {
+      "id": "yura_tseh",
+      "display_name": "Юра з цеха",
+      "names": ["Юра з цеха"],
+      "phones": ["+380979480409"],
+      "emails": []
     }
   ]
 }
