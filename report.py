@@ -58,7 +58,7 @@ def generate_report(messages: list[dict], log_date: str, api_key: str | None = N
         contents=user_content,
         config=types.GenerateContentConfig(
             system_instruction=REPORT_SYSTEM_PROMPT,
-            max_output_tokens=2000,
+            max_output_tokens=3000,
         ),
     )
 
