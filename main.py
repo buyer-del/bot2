@@ -34,7 +34,7 @@ from telegram.error import BadRequest
 from log_filter import filter_log
 from task_analyzer import analyze_day, load_projects
 from report import generate_report
-import storage
+import sheets_api as storage
 
 # =========================
 # ЛОГИ
