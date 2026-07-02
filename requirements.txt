@@ -2,3 +2,6 @@ python-telegram-bot[webhooks]==22.8
 flask
 google-genai
 httpx==0.28.1
+google-api-python-client
+google-auth
+google-auth-httplib2
