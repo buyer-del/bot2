@@ -12,10 +12,27 @@
 
 import json
 import os
+import logging
+from datetime import datetime
 from google import genai
 from google.genai import types
 
 MODEL = "gemini-2.5-flash"
+logger = logging.getLogger(__name__)
+DEBUG_LOG = os.environ.get("DEBUG_LOG", "gemini_debug.log")
+
+
+def _write_debug(section: str, content: str):
+    """Записує запит/відповідь Gemini у файл для діагностики."""
+    try:
+        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {section}\n")
+            f.write(f"{'='*60}\n")
+            f.write(content)
+            f.write("\n")
+    except Exception as e:
+        logger.warning("Не вдалось записати debug-лог: %s", e)
 
 
 def load_projects(projects_path: str) -> list[dict]:
@@ -101,19 +118,19 @@ SYSTEM_PROMPT = """Ти аналізуєш робочу переписку за�
 {
   "new_tasks": [
     {
-      "title": "коротка назва завдання",
+      "title": "коротка назва завдання (до 10 слів)",
       "project_id": "id проєкту зі списку або null",
-      "source_text": "коротка цитата-джерело з повідомлення (до 100 символів)",
+      "source_text": "цитата до 60 символів",
       "source_sender": "хто написав",
-      "reasoning": "одне речення — чому це нове завдання і чому саме цей проєкт"
+      "reasoning": "до 10 слів чому це завдання і який проєкт"
     }
   ],
   "task_updates": [
     {
-      "task_id": "id існуючого завдання зі списку відкритих завдань",
+      "task_id": "id існуючого завдання",
       "new_status": "in_progress | done | other",
-      "comment": "що саме сталося, коротко",
-      "source_text": "коротка цитата-джерело (до 100 символів)",
+      "comment": "до 10 слів що змінилось",
+      "source_text": "цитата до 60 символів",
       "source_sender": "хто написав"
     }
   ]
@@ -141,16 +158,22 @@ def analyze_day(
         _format_open_tasks_block(open_tasks),
     ])
 
+    # Логуємо запит
+    _write_debug("ЗАПИТ ДО GEMINI", user_content)
+
     response = client.models.generate_content(
         model=MODEL,
         contents=user_content,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=8000,
+            max_output_tokens=16000,
         ),
     )
 
     raw_text = response.text.strip()
+
+    # Логуємо сиру відповідь
+    _write_debug("СИРА ВІДПОВІДЬ GEMINI", raw_text)
 
     # На випадок, якщо модель все ж обгорне відповідь у markdown-код-блок
     if raw_text.startswith("```"):
@@ -160,8 +183,12 @@ def analyze_day(
         raw_text = raw_text.strip()
 
     try:
-        return json.loads(raw_text)
+        result = json.loads(raw_text)
+        # Логуємо розпарсений результат
+        _write_debug("РОЗПАРСЕНИЙ РЕЗУЛЬТАТ", json.dumps(result, ensure_ascii=False, indent=2))
+        return result
     except json.JSONDecodeError as e:
+        _write_debug("ПОМИЛКА ПАРСИНГУ JSON", f"Помилка: {e}\nТекст: {raw_text}")
         raise ValueError(f"Gemini повернув не-JSON відповідь: {e}\nВідповідь: {raw_text[:500]}")
 
 
