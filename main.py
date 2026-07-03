@@ -253,6 +253,29 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
 
 
+async def debug_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Надсилає файл gemini_debug.log прямо в чат для діагностики."""
+    debug_path = os.environ.get("DEBUG_LOG", "gemini_debug.log")
+    if not os.path.exists(debug_path):
+        await update.message.reply_text("Файл debug-логу ще не створено — спочатку надішли лог для аналізу.")
+        return
+    try:
+        with open(debug_path, "rb") as f:
+            await update.message.reply_document(document=f, filename="gemini_debug.log")
+    except Exception as e:
+        await update.message.reply_text(f"Помилка при відправці логу: {e}")
+
+
+async def clear_debug_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Очищає debug-лог."""
+    debug_path = os.environ.get("DEBUG_LOG", "gemini_debug.log")
+    try:
+        open(debug_path, "w").close()
+        await update.message.reply_text("✅ Debug-лог очищено.")
+    except Exception as e:
+        await update.message.reply_text(f"Помилка: {e}")
+
+
 # -------------------------
 # ПРИЙОМ ЛОГУ (JSON-файл)
 # -------------------------
@@ -464,6 +487,8 @@ def webhook():
 def main():
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("ping", ping))
+    bot_app.add_handler(CommandHandler("debug", debug_log))
+    bot_app.add_handler(CommandHandler("cleardebug", clear_debug_log))
     bot_app.add_handler(MessageHandler(filters.Document.FileExtension("json"), log_document_message))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     bot_app.add_handler(CallbackQueryHandler(buttons))
