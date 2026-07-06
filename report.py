@@ -8,10 +8,14 @@
 """
 
 import os
+import logging
+from datetime import datetime
 from google import genai
 from google.genai import types
 
 MODEL = "gemini-2.5-flash"
+logger = logging.getLogger(__name__)
+DEBUG_LOG = os.environ.get("DEBUG_LOG", "gemini_debug.log")
 
 REPORT_SYSTEM_PROMPT = """Твоя задача: На основі наданих переписок написати короткий щоденний звіт.
 
@@ -32,26 +36,42 @@ REPORT_SYSTEM_PROMPT = """Твоя задача: На основі надани�
 Формат виходу: ЗВІТ ЗА {дата}: [речення] [речення] ..."""
 
 
-def _format_messages_for_report(messages: list[dict]) -> str:
-    """Готує повідомлення дня у вигляді тексту для промта звіту."""
+def _write_debug(section: str, content: str):
+    try:
+        with open(DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {section}\n")
+            f.write(f"{'='*60}\n")
+            f.write(content)
+            f.write("\n")
+    except Exception as e:
+        logger.warning("Не вдалось записати debug-лог звіту: %s", e)
+
+
+def _format_selection_for_report(selection: list[dict]) -> str:
+    """
+    Форматує вибірку для промту звіту.
+    Вибірка вже очищена від шуму в log_filter.py.
+    """
     lines = []
-    for m in messages:
-        sender = "Я" if m.get("is_own") else m.get("sender", "")
-        lines.append(f"[{m.get('time', '')}] {sender}: {m.get('text', '')}")
+    for m in selection:
+        sender = m.get("from", "")
+        lines.append(f"[{m.get('t', '')}] {sender}: {m.get('msg', '')}")
     return "\n".join(lines)
 
 
-def generate_report(messages: list[dict], log_date: str, api_key: str | None = None) -> str:
+def generate_report(selection: list[dict], log_date: str, api_key: str | None = None) -> str:
     """
-    Генерує текст щоденного звіту.
-
-    messages — увесь масив повідомлень дня (зручно взяти branch_b_status_updates
-    з log_filter.filter_log, оскільки це вже уніфікований список chats+emails).
+    Генерує текст щоденного звіту на основі вибірки повідомлень.
+    selection — результат build_selection() з log_filter.py (вже очищений від шуму).
     log_date — дата з файлу логу (наприклад log_data["export_date"]).
     """
     client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
 
-    user_content = f"Дата логу: {log_date}\n\nПереписка за день:\n{_format_messages_for_report(messages)}"
+    formatted = _format_selection_for_report(selection)
+    user_content = f"Дата логу: {log_date}\n\nПереписка за день:\n{formatted}"
+
+    _write_debug("ЗАПИТ ДО GEMINI (ЗВІТ)", user_content)
 
     response = client.models.generate_content(
         model=MODEL,
@@ -62,4 +82,6 @@ def generate_report(messages: list[dict], log_date: str, api_key: str | None = N
         ),
     )
 
-    return response.text.strip()
+    result = response.text.strip()
+    _write_debug("ВІДПОВІДЬ GEMINI (ЗВІТ)", result)
+    return result
