@@ -110,26 +110,29 @@ async def _send_with_keyboard(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
 # -------------------------
 def _build_confirm_queue(analysis: dict) -> list[dict]:
     """
-    Перетворює результат analyze_day() на чергу елементів для послідовного
-    підтвердження: спочатку всі кандидати на нові проєкти (мають бути
-    зафіксовані остаточно до запису завдань, Розділ 5-6), а ПОТІМ нові
-    завдання й оновлення статусу ЧЕРГУЮТЬСЯ між собою — щоб оновлення
-    статусу не губились у кінці довгого списку нових завдань.
+    Формує чергу підтверджень. Тільки два типи елементів:
+    - new_task: нове завдання (project_id може бути конкретним або "other")
+    - task_update: оновлення статусу існуючого завдання
+
+    Жодних "нових проєктів" в автоматичному потоці — проєкти ведуться
+    вручну через projects.json і команду синхронізації.
+    Завдання без project_id автоматично отримують project_id="other".
     """
     queue = []
 
     new_tasks = analysis.get("new_tasks", [])
     task_updates = analysis.get("task_updates", [])
 
+    # Нормалізуємо: null → "other"
     for t in new_tasks:
         if not t.get("project_id"):
-            queue.append({"type": "new_project_candidate", "payload": t})
+            t["project_id"] = "other"
 
     new_task_items = [{"type": "new_task", "payload": t} for t in new_tasks]
     update_items = [{"type": "task_update", "payload": u} for u in task_updates]
 
-    # Чергування (round-robin), щоб обидва типи були рівномірно представлені в черзі
-    max_len = max(len(new_task_items), len(update_items))
+    # Чергуємо нові завдання і оновлення статусу
+    max_len = max(len(new_task_items), len(update_items), 1)
     for i in range(max_len):
         if i < len(new_task_items):
             queue.append(new_task_items[i])
@@ -139,20 +142,14 @@ def _build_confirm_queue(analysis: dict) -> list[dict]:
     return queue
 
 
-def _kb_new_project(payload: dict) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Прийняти", callback_data="np_accept")],
-        [InlineKeyboardButton("✏️ Виправити назву", callback_data="np_edit")],
-        [InlineKeyboardButton("🔗 Це вже існуючий проєкт", callback_data="np_link")],
-        [InlineKeyboardButton("❌ Відхилити", callback_data="np_reject")],
-    ])
-
-
-def _kb_new_task() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def _kb_new_task(payload: dict, projects: list[dict]) -> InlineKeyboardMarkup:
+    proj = payload.get("project_id", "other")
+    rows = [
         [InlineKeyboardButton("✅ Додати завдання", callback_data="nt_accept")],
+        [InlineKeyboardButton("🔗 Змінити проєкт", callback_data="nt_change_project")],
         [InlineKeyboardButton("❌ Відхилити", callback_data="nt_reject")],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def _kb_task_update() -> InlineKeyboardMarkup:
@@ -164,10 +161,10 @@ def _kb_task_update() -> InlineKeyboardMarkup:
 
 def _kb_project_list(projects: list[dict]) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(p["full_name"], callback_data=f"np_link_pick_{p['id']}")]
+        [InlineKeyboardButton(p["full_name"], callback_data=f"proj_pick_{p['id']}")]
         for p in projects
     ]
-    rows.append([InlineKeyboardButton("« Назад", callback_data="np_link_cancel")])
+    rows.append([InlineKeyboardButton("« Назад", callback_data="proj_pick_cancel")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -204,26 +201,19 @@ async def _present_next(update_or_chat_id, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pending_item"] = item
     payload = item["payload"]
 
-    if item["type"] == "new_project_candidate":
-        text = (
-            f"🆕 Схоже на новий проєкт.\n\n"
-            f"Запропонована назва: {payload.get('title', '(не вказано)')}\n"
-            f"Джерело: \"{payload.get('source_text', '')}\"\n"
-            f"Від: {payload.get('source_sender', '')}\n"
-            f"Причина: {payload.get('reasoning', '')}"
-        )
-        await _send_with_keyboard(context, chat_id, text, _kb_new_project(payload))
-
-    elif item["type"] == "new_task":
-        proj = payload.get("project_id") or "не визначено"
+    if item["type"] == "new_task":
+        proj = payload.get("project_id") or "other"
+        # Знаходимо повну назву проєкту для відображення
+        projects = storage.get_projects()
+        proj_name = next((p["full_name"] for p in projects if p["id"] == proj), proj)
         text = (
             f"📌 Нове завдання:\n\n"
             f"{payload.get('title')}\n"
-            f"Проєкт: {proj}\n"
+            f"Проєкт: {proj_name}\n"
             f"Джерело: \"{payload.get('source_text', '')}\"\n"
             f"Від: {payload.get('source_sender', '')}"
         )
-        await _send_with_keyboard(context, chat_id, text, _kb_new_task())
+        await _send_with_keyboard(context, chat_id, text, _kb_new_task(payload, projects))
 
     elif item["type"] == "task_update":
         task = storage.get_task_by_id(int(payload["task_id"])) if str(payload.get("task_id", "")).isdigit() else None
@@ -341,64 +331,11 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     payload = item["payload"]
 
-    # --- Новий проєкт: прийняти як є ---
-    if data == "np_accept":
-        projects = storage.get_projects()
-        new_id = payload.get("title")
-        projects.append({"id": new_id, "short_number": "", "full_name": payload.get("title")})
-        storage.set_projects(projects)
-        await _remove_old_keyboard(context)
-        await q.message.reply_text(f"✅ Новий проєкт додано: {payload.get('title')}")
-        await _present_next(update, context)
-        return
-
-    # --- Новий проєкт: виправити назву (запит тексту) ---
-    if data == "np_edit":
-        context.user_data["awaiting_project_name_edit"] = True
-        await q.message.reply_text("Напиши правильну назву проєкту звичайним повідомленням:")
-        return
-
-    # --- Новий проєкт: це вже існуючий — показати список ---
-    if data == "np_link":
-        projects = storage.get_projects()
-        if not projects:
-            await q.message.reply_text("Список наявних проєктів порожній.")
-            return
-        await _remove_old_keyboard(context)
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Обери, до якого проєкту відноситься:",
-            reply_markup=_kb_project_list(projects),
-        )
-        return
-
-    if data.startswith("np_link_pick_"):
-        picked_id = data[len("np_link_pick_"):]
-        # Завдання, що чекало на новий проєкт, тепер прив'язується до обраного
-        for qitem in _queue(context):
-            if qitem["type"] == "new_task" and qitem["payload"].get("title") == payload.get("title"):
-                qitem["payload"]["project_id"] = picked_id
-        await _remove_old_keyboard(context)
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🔗 Прив'язано до проєкту {picked_id}")
-        await _present_next(update, context)
-        return
-
-    if data == "np_link_cancel":
-        await _present_next(update, context)
-        return
-
-    # --- Новий проєкт: відхилити ---
-    if data == "np_reject":
-        await _remove_old_keyboard(context)
-        await q.message.reply_text("❌ Відхилено.")
-        await _present_next(update, context)
-        return
-
     # --- Нове завдання: прийняти ---
     if data == "nt_accept":
         storage.add_task(
             title=payload.get("title"),
-            project_id=payload.get("project_id"),
+            project_id=payload.get("project_id", "other"),
             source_text=payload.get("source_text", ""),
             source_sender=payload.get("source_sender", ""),
         )
@@ -411,6 +348,58 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _remove_old_keyboard(context)
         await q.message.reply_text("❌ Відхилено.")
         await _present_next(update, context)
+        return
+
+    # --- Нове завдання: змінити проєкт ---
+    if data == "nt_change_project":
+        projects = storage.get_projects()
+        if not projects:
+            await q.message.reply_text("Список проєктів порожній.")
+            return
+        await _remove_old_keyboard(context)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Обери проєкт для цього завдання:",
+            reply_markup=_kb_project_list(projects),
+        )
+        return
+
+    if data.startswith("proj_pick_"):
+        picked_id = data[len("proj_pick_"):]
+        item = _pending(context)
+        if item:
+            item["payload"]["project_id"] = picked_id
+        await _remove_old_keyboard(context)
+        # Показуємо завдання знову з оновленим проєктом
+        projects = storage.get_projects()
+        payload = item["payload"]
+        proj_name = next((p["full_name"] for p in projects if p["id"] == picked_id), picked_id)
+        text = (
+            f"📌 Нове завдання (проєкт оновлено):\n\n"
+            f"{payload.get('title')}\n"
+            f"Проєкт: {proj_name}\n"
+            f"Джерело: \"{payload.get('source_text', '')}\"\n"
+            f"Від: {payload.get('source_sender', '')}"
+        )
+        await _send_with_keyboard(context, update.effective_chat.id, text, _kb_new_task(payload, projects))
+        return
+
+    if data == "proj_pick_cancel":
+        # Повертаємось до завдання без змін
+        item = _pending(context)
+        if item:
+            projects = storage.get_projects()
+            payload = item["payload"]
+            proj = payload.get("project_id", "other")
+            proj_name = next((p["full_name"] for p in projects if p["id"] == proj), proj)
+            text = (
+                f"📌 Нове завдання:\n\n"
+                f"{payload.get('title')}\n"
+                f"Проєкт: {proj_name}\n"
+                f"Джерело: \"{payload.get('source_text', '')}\"\n"
+                f"Від: {payload.get('source_sender', '')}"
+            )
+            await _send_with_keyboard(context, update.effective_chat.id, text, _kb_new_task(payload, projects))
         return
 
     # --- Оновлення статусу: підтвердити ---
@@ -434,22 +423,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ТЕКСТ (використовується для введення нової назви проєкту)
 # -------------------------
 async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("awaiting_project_name_edit"):
-        new_name = (update.message.text or "").strip()
-        context.user_data["awaiting_project_name_edit"] = False
-
-        item = _pending(context)
-        if item:
-            projects = storage.get_projects()
-            new_id = new_name
-            projects.append({"id": new_id, "short_number": "", "full_name": new_name})
-            storage.set_projects(projects)
-            await update.message.reply_text(f"✅ Проєкт додано з назвою: {new_name}")
-            await _present_next(update, context)
-        return
-
-    # Поза сценарієм підтвердження — текст просто ігнорується (бот не приймає довільні
-    # повідомлення для аналізу; лог надсилається тільки файлом).
     await update.message.reply_text(
         "Надішли JSON-файл логу командою 'поділитися' з додатку логування."
     )
