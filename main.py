@@ -31,7 +31,7 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest
 
-from log_filter import filter_log
+from log_filter import build_selection
 from task_analyzer import analyze_day, load_projects
 from report import generate_report
 import sheets_api as storage
@@ -294,24 +294,23 @@ async def log_document_message(update: Update, context: ContextTypes.DEFAULT_TYP
         with open(local_path, "r", encoding="utf-8") as f:
             log_data = json.load(f)
 
-        filtered = filter_log(log_data, CONTACTS_FILE)
         projects = load_projects(PROJECTS_FILE) if os.path.exists(PROJECTS_FILE) else storage.get_projects()
         open_tasks = storage.get_open_tasks()
 
+        selection = await asyncio.to_thread(
+            build_selection,
+            log_data, CONTACTS_FILE, PROJECTS_FILE, open_tasks,
+        )
+
         analysis = await asyncio.to_thread(
             analyze_day,
-            filtered["branch_a_new_tasks"],
-            filtered["branch_b_status_updates"],
-            projects,
-            open_tasks,
+            selection, projects, open_tasks,
         )
 
         queue = _build_confirm_queue(analysis)
         context.user_data["confirm_queue"] = queue
 
-        # Зберігаємо дані для звіту (Крок 6) — викличеться після завершення
-        # підтвердження всіх пропозицій (Крок 4-5).
-        context.user_data["report_messages"] = filtered["branch_b_status_updates"]
+        context.user_data["report_messages"] = selection
         context.user_data["report_date"] = log_data.get("export_date", "")
 
         n_new = len(analysis.get("new_tasks", []))
