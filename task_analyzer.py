@@ -103,7 +103,12 @@ SYSTEM_PROMPT = """Ти аналізуєш робочу переписку за�
 
 ПРАВИЛА ДЛЯ ОНОВЛЕНЬ СТАТУСУ — аналізуй УСІ повідомлення (з task_source і без):
 - Чи стосується повідомлення вже існуючого завдання зі списку відкритих завдань?
-- Підтвердження, рахунок, інформація про доставку, власна дія користувача — все це оновлення.
+- ВАЖЛИВО: task_updates стосується ВИКЛЮЧНО завдань які вже є у переданому списку
+  відкритих завдань. Якщо список порожній — task_updates теж має бути порожнім масивом.
+- НЕ створюй оновлення для завдань які ти щойно додав у new_tasks — вони ще не існують.
+- task_id ЗАВЖДИ числовий (беремо поле "id" з переданого списку відкритих завдань).
+  Якщо не знайшов відповідного id — не створюй оновлення взагалі.
+- Підтвердження, рахунок, інформація про доставку, власна дія користувача — це оновлення.
 - "ОК" від довіреного колеги у відповідь на запит — може бути підтвердженням дозволу на дію.
 - Не вигадуй оновлення якщо зв'язок неочевидний.
 
@@ -120,7 +125,8 @@ SYSTEM_PROMPT = """Ти аналізуєш робочу переписку за�
   ],
   "task_updates": [
     {
-      "task_id": "id існуючого завдання",
+      "task_id": "числовий id завдання зі списку відкритих завдань",
+      "title": "назва завдання зі списку відкритих завдань",
       "new_status": "in_progress | done | other",
       "comment": "до 10 слів що змінилось",
       "source_text": "цитата до 60 символів",
@@ -167,7 +173,19 @@ def analyze_day(
         _format_open_tasks_block(open_tasks),
     ])
 
-    _write_debug("ЗАПИТ ДО GEMINI", user_content)
+    _write_debug("SYSTEM PROMPT", SYSTEM_PROMPT)
+    _write_debug("ЗАПИТ ДО GEMINI (user content)", user_content)
+
+    # Для зручності читання — окремо логуємо вибірку у форматованому вигляді
+    try:
+        selection_start = user_content.find("[{")
+        if selection_start != -1:
+            selection_end = user_content.find("]", selection_start) + 1
+            raw_selection = user_content[selection_start:selection_end]
+            parsed = json.loads(raw_selection)
+            _write_debug("ВИБІРКА (форматована)", json.dumps(parsed, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
 
     response = client.models.generate_content(
         model=MODEL,
