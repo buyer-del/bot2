@@ -71,6 +71,7 @@ def generate_report(selection: list[dict], log_date: str, api_key: str | None = 
     formatted = _format_selection_for_report(selection)
     user_content = f"Дата логу: {log_date}\n\nПереписка за день:\n{formatted}"
 
+    _write_debug("SYSTEM PROMPT (ЗВІТ)", REPORT_SYSTEM_PROMPT)
     _write_debug("ЗАПИТ ДО GEMINI (ЗВІТ)", user_content)
 
     response = client.models.generate_content(
