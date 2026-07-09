@@ -301,10 +301,20 @@ def build_selection(
             logger.warning("Не вдалось отримати anchor-embeddings: %s. Embedding-фільтр вимкнено.", e)
 
     selection = []
+    msg_counter = {}  # для унікальності id якщо час однаковий
+
     for m in all_messages:
         text = m.get("text", "").strip()
         if not text:
             continue
+
+        # Формуємо унікальний source_id: YYYYMMDD_HHMM_платформа_лічильник
+        log_date = log_data.get("export_date", "")[:10].replace("-", "")
+        time_str = (m.get("time", "") or "").replace(":", "")[:4]
+        platform_str = (m.get("platform", "") or "").lower()[:5].replace(" ", "")
+        base_id = f"{log_date}_{time_str}_{platform_str}"
+        msg_counter[base_id] = msg_counter.get(base_id, 0) + 1
+        source_id = f"{base_id}_{msg_counter[base_id]}"
 
         # Перевірка чи від особливого контакту
         check_msg = {
@@ -316,17 +326,18 @@ def build_selection(
         if is_special:
             # Особливий контакт — завжди включаємо, ніяких фільтрів
             selection.append({
+                "id": source_id,
                 "t": m.get("time", ""),
                 "from": m["sender"] or "Я",
                 "chat": f"{m['platform']} / {m['chat_name']}",
                 "msg": text,
-                "task_source": not m["is_own"],  # власні повідомлення особливого контакту — не джерело завдань
+                "task_source": not m["is_own"],
             })
         elif m["is_own"]:
-            # Власні повідомлення (контекст розмови) — включаємо без embedding-фільтра
-            # але відсіюємо технічний шум
+            # Власні повідомлення — включаємо без embedding-фільтра але відсіюємо шум
             if not _is_spam(m):
                 selection.append({
+                    "id": source_id,
                     "t": m.get("time", ""),
                     "from": "Я",
                     "chat": f"{m['platform']} / {m['chat_name']}",
@@ -340,6 +351,7 @@ def build_selection(
             if anchor_embeddings and not _is_relevant_by_embedding(text, anchor_embeddings, api_key):
                 continue
             selection.append({
+                "id": source_id,
                 "t": m.get("time", ""),
                 "from": m["sender"] or "",
                 "chat": f"{m['platform']} / {m['chat_name']}",
