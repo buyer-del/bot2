@@ -123,9 +123,12 @@ def _build_confirm_queue(analysis: dict) -> list[dict]:
     new_tasks = analysis.get("new_tasks", [])
     task_updates = analysis.get("task_updates", [])
 
-    # Нормалізуємо: null → "other"
+    # Відкидаємо оновлення де task_id не числовий — Gemini міг підставити назву замість id
+    task_updates = [u for u in task_updates if str(u.get("task_id", "")).isdigit()]
+
+    # Нормалізуємо project_id: null або рядок "null" → "other"
     for t in new_tasks:
-        if not t.get("project_id"):
+        if not t.get("project_id") or t.get("project_id") == "null":
             t["project_id"] = "other"
 
     new_task_items = [{"type": "new_task", "payload": t} for t in new_tasks]
@@ -203,28 +206,29 @@ async def _present_next(update_or_chat_id, context: ContextTypes.DEFAULT_TYPE):
 
     if item["type"] == "new_task":
         proj = payload.get("project_id") or "other"
-        # Знаходимо повну назву проєкту для відображення
         projects = storage.get_projects()
         proj_name = next((p["full_name"] for p in projects if p["id"] == proj), proj)
+        source_id = payload.get("source_id", "")
         text = (
             f"📌 Нове завдання:\n\n"
             f"{payload.get('title')}\n"
             f"Проєкт: {proj_name}\n"
-            f"Джерело: \"{payload.get('source_text', '')}\"\n"
-            f"Від: {payload.get('source_sender', '')}"
+            f"Від: {payload.get('source_sender', '')}\n"
+            f"Джерело [{source_id}]: \"{payload.get('source_text', '')}\""
         )
         await _send_with_keyboard(context, chat_id, text, _kb_new_task(payload, projects))
 
     elif item["type"] == "task_update":
         task = storage.get_task_by_id(int(payload["task_id"])) if str(payload.get("task_id", "")).isdigit() else None
-        task_title = task["title"] if task else f"id={payload.get('task_id')}"
+        task_title = task["title"] if task else payload.get("title") or f"id={payload.get('task_id')}"
+        source_id = payload.get("source_id", "")
         text = (
             f"🔄 Оновлення статусу:\n\n"
             f"Завдання: {task_title}\n"
             f"Новий статус: {payload.get('new_status')}\n"
             f"Коментар: {payload.get('comment', '')}\n"
-            f"Джерело: \"{payload.get('source_text', '')}\"\n"
-            f"Від: {payload.get('source_sender', '')}"
+            f"Від: {payload.get('source_sender', '')}\n"
+            f"Джерело [{source_id}]: \"{payload.get('source_text', '')}\""
         )
         await _send_with_keyboard(context, chat_id, text, _kb_task_update())
 
@@ -405,10 +409,18 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Оновлення статусу: підтвердити ---
     if data == "tu_accept":
         task_id = payload.get("task_id")
+        # Захист: task_id має бути числом. Якщо Gemini повернув текст — ігноруємо оновлення
         if str(task_id).isdigit():
-            storage.update_task_status(int(task_id), payload.get("new_status", "in_progress"), payload.get("comment", ""))
-        await _remove_old_keyboard(context)
-        await q.message.reply_text("✅ Статус оновлено.")
+            storage.update_task_status(
+                int(task_id),
+                payload.get("new_status", "in_progress"),
+                payload.get("comment", ""),
+            )
+            await _remove_old_keyboard(context)
+            await q.message.reply_text("✅ Статус оновлено.")
+        else:
+            await _remove_old_keyboard(context)
+            await q.message.reply_text(f"⚠️ Не вдалося оновити статус: завдання з id={task_id} не знайдено в таблиці.")
         await _present_next(update, context)
         return
 
