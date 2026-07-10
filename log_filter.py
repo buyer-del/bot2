@@ -53,30 +53,66 @@ _SPAM_SENDER_PATTERNS = [
     r"noreply", r"no-reply", r"newsletter", r"notification",
     r"marketing", r"promo", r"support@", r"info@", r"hello@",
     r"sales@", r"deals@", r"updates@", r"mailer",
+    r"rozetka", r"brain\.ua", r"prom\.ua", r"epicentrk",
+    r"ukrposhta", r"novaposhta.*info", r"meest",
 ]
 
 # Ознаки рекламних тем листів
 _SPAM_SUBJECT_PATTERNS = [
-    r"розпродаж", r"акція", r"знижк", r"промокод", r"підпис",
+    r"розпродаж", r"акція", r"знижк", r"промокод",
     r"unsubscribe", r"відпис", r"newsletter", r"рекламн",
     r"спеціальна пропозиція", r"тільки сьогодні",
+    r"нові надходження", r"топ товар", r"купуй зараз",
 ]
 
-# Ознаки рекламних повідомлень у Viber (часто містять ці слова)
+# Ознаки рекламних повідомлень у Viber
 _SPAM_VIBER_PATTERNS = [
     r"відпис", r"unsubscribe", r"натисніть тут", r"click here",
     r"переходьте за посиланням", r"замовляйте зараз",
 ]
 
+# Маркери підпису — від цього місця відрізаємо все до кінця
+_SIGNATURE_MARKERS = [
+    "Kind Regards", "Best regards", "Best Regards",
+    "Regards,", "BR\n", "BR,",
+    "З повагою", "З повагою,",
+    "Дякуємо", "Дякую,",
+    "Thank you,", "Thanks,",
+    "Sincerely,",
+    "[image:", "[cid:",
+    "Phone:", "Mobile:", "Tel.:",
+    "NIP:", "KRS:", "REGON:",
+    "Confidentiality Notice",
+]
+
+# Маркери початку цитати попереднього листа
+_QUOTE_MARKERS = [
+    "\nFrom:", "\nOd:", "\nVid:", "\nDe:",
+    "\nSent:", "\nWysłane:", "\nНадіслано:",
+    "\n-----", "\n_____",
+    "\nOn ", "\n>",
+    "\nчт,", "\nпн,", "\nвт,", "\nср,", "\nпт,", "\nсб,", "\nнд,",
+    "\nPn,", "\nWt,", "\nŚr,", "\nCz,", "\nPt,",
+]
+
+# Технічні рядки які видаляємо навіть з середини тексту
+_TECH_LINE_PATTERNS = [
+    r"\[cid:[^\]]+\]",           # вбудовані зображення [cid:...]
+    r"<https?://[^>]+>",         # посилання в кутових дужках <http://...>
+    r"\[https?://[^\]]+\]",      # посилання в квадратних дужках [http://...]
+    r"https?://\S+",             # голі посилання
+    r"www\.\S+",                 # www посилання
+    r"⚠.*?⚠",                   # попередження про зовнішній відправник
+]
+
 
 def _is_spam(message: dict) -> bool:
     """
-    Технічний фільтр шуму — відсіює рекламні та автоматичні повідомлення
-    за ознаками відправника, теми листа або тексту (для Viber-розсилок).
+    Технічний фільтр шуму — відсіює рекламні та автоматичні повідомлення.
     """
     sender_email = _normalize(message.get("sender_email", ""))
     subject = _normalize(message.get("chat_name", "") or "")
-    text = _normalize(message.get("text", "") or "")
+    text = message.get("text", "") or ""
     source = message.get("source", "")
 
     # Перевірка за email відправника
@@ -89,11 +125,15 @@ def _is_spam(message: dict) -> bool:
         for pattern in _SPAM_SUBJECT_PATTERNS:
             if re.search(pattern, subject):
                 return True
+        # Якщо лист містить багато посилань — ознака реклами
+        link_count = len(re.findall(r"https?://", text))
+        if link_count > 5:
+            return True
 
     # Перевірка за текстом (Viber-розсилки)
     if source == "chat":
         for pattern in _SPAM_VIBER_PATTERNS:
-            if re.search(pattern, text):
+            if re.search(pattern, _normalize(text)):
                 return True
 
     return False
@@ -102,23 +142,34 @@ def _is_spam(message: dict) -> bool:
 # ─── Очищення тексту ─────────────────────────────────────────────────────────
 
 def _clean_email_text(text: str) -> str:
-    """Прибирає типові email-підписи і цитати попередніх листів."""
-    # Відрізаємо підпис
-    signature_markers = ["Kind Regards", "Best regards", "З повагою", "[image:"]
+    """
+    Агресивне очищення email-тексту:
+    1. Відрізаємо підпис і все що після нього (включно з підписом)
+    2. Відрізаємо цитати попередніх листів
+    3. Видаляємо технічні рядки (посилання, cid, попередження)
+    """
+    if not text:
+        return ""
+
+    # Крок 1: відрізаємо від першого маркера підпису або цитати
     cut_at = len(text)
-    for marker in signature_markers:
+    for marker in _SIGNATURE_MARKERS + _QUOTE_MARKERS:
         idx = text.find(marker)
         if idx != -1:
             cut_at = min(cut_at, idx)
 
-    # Відрізаємо цитату попереднього листа (рядки що починаються з ">", або "пише:")
-    quote_markers = ["\nOn ", "\nVid:", "\nчт,", "\nпн,", "\nвт,", "\nср,", "\nпт,", "\nсб,", "\nнд,"]
-    for marker in quote_markers:
-        idx = text.find(marker)
-        if idx != -1:
-            cut_at = min(cut_at, idx)
+    text = text[:cut_at].strip()
 
-    return text[:cut_at].strip()
+    # Крок 2: видаляємо технічні рядки через regex
+    for pattern in _TECH_LINE_PATTERNS:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
+
+    # Крок 3: прибираємо порожні рядки що утворились після очищення
+    lines = [line.strip() for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    text = "\n".join(lines)
+
+    return text.strip()
 
 
 # ─── Розпізнавання групових повідомлень ──────────────────────────────────────
