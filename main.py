@@ -189,7 +189,14 @@ async def _present_next(update_or_chat_id, context: ContextTypes.DEFAULT_TYPE):
         if report_messages is not None:
             await context.bot.send_message(chat_id=chat_id, text="✅ Усі пропозиції за сьогодні опрацьовано.\n📝 Складаю звіт за день…")
             try:
-                report_text = await asyncio.to_thread(generate_report, report_messages, report_date)
+                # Передаємо відкриті завдання для контексту звіту
+                report_tasks = storage.get_open_tasks()
+                report_text = await asyncio.to_thread(
+                    generate_report,
+                    report_messages,
+                    report_date,
+                    report_tasks,
+                )
                 await context.bot.send_message(chat_id=chat_id, text=report_text)
             except Exception as e:
                 logger.exception("Помилка генерації звіту: %s", e)
