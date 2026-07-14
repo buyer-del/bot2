@@ -1,16 +1,15 @@
 """
 Модуль роботи з Google Таблицею для зберігання завдань.
 
-Замінює тимчасовий storage.py (локальний JSON-файл).
-Інтерфейс функцій лишається тим самим, що і в storage.py —
-решта коду бота не змінюється.
-
 Структура колонок таблиці:
 A: ID | B: Дата створення | C: Проєкт | D: Назва завдання |
 E: Статус | F: Від кого | G: Джерело (цитата) | H: Коментар
 
-Авторизація: сервісний ключ з GOOGLE_CREDENTIALS_JSON (Render Environment).
-ID таблиці: з SHEETS_SPREADSHEET_ID (Render Environment).
+Статуси (українською):
+- відкрито  — нове завдання, ще нічого не робилось
+- в роботі  — розпочато: надіслав запит, чекаю відповіді, веду переговори
+- виконано  — завдання закрите, дія завершена
+- відкладено — поки не актуально, але не закрите
 """
 
 import os
@@ -26,7 +25,26 @@ SPREADSHEET_ID = os.environ.get("SHEETS_SPREADSHEET_ID")
 SHEET_NAME = "Завдання"
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-# Індекси колонок (0-based для читання, 1-based для запису через A1 нотацію)
+# Статуси українською
+STATUS_OPEN = "відкрито"
+STATUS_IN_PROGRESS = "в роботі"
+STATUS_DONE = "виконано"
+STATUS_POSTPONED = "відкладено"
+
+# Відображення англійських статусів (від Gemini) на українські
+STATUS_MAP = {
+    "open": STATUS_OPEN,
+    "in_progress": STATUS_IN_PROGRESS,
+    "done": STATUS_DONE,
+    "other": STATUS_POSTPONED,
+    # На випадок якщо Gemini поверне українські одразу
+    "відкрито": STATUS_OPEN,
+    "в роботі": STATUS_IN_PROGRESS,
+    "виконано": STATUS_DONE,
+    "відкладено": STATUS_POSTPONED,
+}
+
+# Індекси колонок
 COL_ID = 0        # A
 COL_DATE = 1      # B
 COL_PROJECT = 2   # C
@@ -37,18 +55,21 @@ COL_SOURCE = 6    # G
 COL_COMMENT = 7   # H
 
 
+def normalize_status(status: str) -> str:
+    """Перетворює будь-який формат статусу на українську назву."""
+    return STATUS_MAP.get(status.strip().lower(), STATUS_OPEN)
+
+
 def _get_service():
-    """Авторизація через сервісний акаунт з GOOGLE_CREDENTIALS_JSON."""
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if not creds_json:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON не задано в змінних середовища")
+        raise RuntimeError("GOOGLE_CREDENTIALS_JSON не задано")
     creds_data = json.loads(creds_json)
     creds = Credentials.from_service_account_info(creds_data, scopes=SCOPES)
     return build("sheets", "v4", credentials=creds)
 
 
 def _get_all_rows() -> list[list]:
-    """Повертає всі рядки таблиці (без заголовка)."""
     service = _get_service()
     result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
@@ -58,7 +79,6 @@ def _get_all_rows() -> list[list]:
 
 
 def _ensure_header():
-    """Перевіряє і створює заголовок таблиці, якщо він відсутній."""
     service = _get_service()
     result = service.spreadsheets().values().get(
         spreadsheetId=SPREADSHEET_ID,
@@ -75,7 +95,6 @@ def _ensure_header():
 
 
 def _next_id(rows: list[list]) -> int:
-    """Визначає наступний вільний ID на основі наявних рядків."""
     if not rows:
         return 1
     ids = []
@@ -87,14 +106,24 @@ def _next_id(rows: list[list]) -> int:
     return max(ids) + 1 if ids else 1
 
 
-# ─── Публічний інтерфейс (аналогічний storage.py) ───────────────────────────
+def _row_to_dict(row: list) -> dict:
+    while len(row) < 8:
+        row.append("")
+    return {
+        "id": row[COL_ID],
+        "created_date": row[COL_DATE],
+        "project_id": row[COL_PROJECT],
+        "title": row[COL_TITLE],
+        "status": row[COL_STATUS],
+        "source_sender": row[COL_SENDER],
+        "source_text": row[COL_SOURCE],
+        "comment": row[COL_COMMENT],
+    }
+
+
+# ─── Проєкти ────────────────────────────────────────────────────────────────
 
 def get_projects() -> list[dict]:
-    """
-    Повертає список проєктів із файлу projects.json.
-    Проєкти зберігаються у файлі, а не в таблиці —
-    таблиця лише для завдань.
-    """
     projects_path = os.environ.get("PROJECTS_FILE", "projects.json")
     if not os.path.exists(projects_path):
         return []
@@ -104,7 +133,6 @@ def get_projects() -> list[dict]:
 
 
 def set_projects(projects: list[dict]):
-    """Оновлює список проєктів у файлі projects.json."""
     projects_path = os.environ.get("PROJECTS_FILE", "projects.json")
     try:
         with open(projects_path, "r", encoding="utf-8") as f:
@@ -116,37 +144,48 @@ def set_projects(projects: list[dict]):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+# ─── Завдання ────────────────────────────────────────────────────────────────
+
 def get_open_tasks() -> list[dict]:
-    """Повертає всі завдання зі статусом, що не є 'done'."""
+    """Повертає всі завдання крім виконаних."""
     rows = _get_all_rows()
-    tasks = []
-    for row in rows:
-        # Доповнюємо рядок до потрібної довжини якщо є порожні колонки
-        while len(row) < 8:
-            row.append("")
-        status = row[COL_STATUS]
-        if status != "done":
-            tasks.append({
-                "id": row[COL_ID],
-                "created_date": row[COL_DATE],
-                "project_id": row[COL_PROJECT],
-                "title": row[COL_TITLE],
-                "status": status,
-                "source_sender": row[COL_SENDER],
-                "source_text": row[COL_SOURCE],
-                "comment": row[COL_COMMENT],
-            })
-    return tasks
+    return [
+        _row_to_dict(list(row))
+        for row in rows
+        if row and row[COL_STATUS] != STATUS_DONE
+    ]
 
 
-def add_task(title: str, project_id: str | None, source_text: str, source_sender: str) -> dict:
-    """Додає нове завдання в таблицю і повертає його як dict."""
+def get_done_tasks() -> list[dict]:
+    """Повертає виконані завдання."""
+    rows = _get_all_rows()
+    return [
+        _row_to_dict(list(row))
+        for row in rows
+        if row and row[COL_STATUS] == STATUS_DONE
+    ]
+
+
+def get_all_tasks() -> list[dict]:
+    """Повертає всі завдання."""
+    rows = _get_all_rows()
+    return [_row_to_dict(list(row)) for row in rows if row]
+
+
+def add_task(
+    title: str,
+    project_id: str | None,
+    source_text: str,
+    source_sender: str,
+    status: str = STATUS_OPEN,
+) -> dict:
+    """Додає нове завдання в таблицю."""
     _ensure_header()
     rows = _get_all_rows()
     task_id = _next_id(rows)
     today = str(date.today())
     project = project_id or ""
-    status = "open"
+    normalized_status = normalize_status(status)
 
     service = _get_service()
     service.spreadsheets().values().append(
@@ -155,25 +194,59 @@ def add_task(title: str, project_id: str | None, source_text: str, source_sender
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": [[
-            task_id, today, project, title, status, source_sender, source_text, ""
+            task_id, today, project, title,
+            normalized_status, source_sender, source_text, ""
         ]]},
     ).execute()
 
-    logger.info("Додано завдання id=%s: %s", task_id, title)
+    logger.info("Додано завдання id=%s: %s [%s]", task_id, title, normalized_status)
     return {
         "id": task_id,
         "created_date": today,
         "project_id": project,
         "title": title,
-        "status": status,
+        "status": normalized_status,
         "source_sender": source_sender,
         "source_text": source_text,
         "comment": "",
     }
 
 
-def update_task_status(task_id: int | str, new_status: str, comment: str):
-    """Оновлює статус і коментар існуючого завдання за його ID."""
+def update_task_status(task_id: int | str, new_status: str, comment: str = ""):
+    """Оновлює статус і коментар існуючого завдання."""
+    service = _get_service()
+    rows = _get_all_rows()
+    normalized = normalize_status(new_status)
+
+    for i, row in enumerate(rows):
+        if not row:
+            continue
+        try:
+            if str(row[COL_ID]) == str(task_id):
+                row_num = i + 2
+                while len(row) < 8:
+                    row.append("")
+                service.spreadsheets().values().update(
+                    spreadsheetId=SPREADSHEET_ID,
+                    range=f"{SHEET_NAME}!E{row_num}:H{row_num}",
+                    valueInputOption="RAW",
+                    body={"values": [[
+                        normalized,
+                        row[COL_SENDER],
+                        row[COL_SOURCE],
+                        comment if comment else row[COL_COMMENT],
+                    ]]},
+                ).execute()
+                logger.info("Оновлено id=%s: статус=%s", task_id, normalized)
+                return
+        except (IndexError, ValueError):
+            continue
+
+    logger.warning("Завдання id=%s не знайдено", task_id)
+
+
+def update_task_comment(task_id: int | str, comment: str):
+    """Оновлює тільки коментар завдання."""
     service = _get_service()
     rows = _get_all_rows()
 
@@ -182,42 +255,70 @@ def update_task_status(task_id: int | str, new_status: str, comment: str):
             continue
         try:
             if str(row[COL_ID]) == str(task_id):
-                # Рядок у таблиці = i+2 (рядок 1 — заголовок, рядки нумеруються з 1)
                 row_num = i + 2
                 service.spreadsheets().values().update(
                     spreadsheetId=SPREADSHEET_ID,
-                    range=f"{SHEET_NAME}!E{row_num}:H{row_num}",
+                    range=f"{SHEET_NAME}!H{row_num}",
                     valueInputOption="RAW",
-                    body={"values": [[new_status, row[COL_SENDER] if len(row) > COL_SENDER else "", row[COL_SOURCE] if len(row) > COL_SOURCE else "", comment]]},
+                    body={"values": [[comment]]},
                 ).execute()
-                logger.info("Оновлено завдання id=%s: статус=%s", task_id, new_status)
+                logger.info("Оновлено коментар id=%s", task_id)
                 return
         except (IndexError, ValueError):
             continue
 
-    logger.warning("Завдання id=%s не знайдено для оновлення", task_id)
+    logger.warning("Завдання id=%s не знайдено для оновлення коментаря", task_id)
+
+
+def delete_task(task_id: int | str):
+    """Видаляє рядок завдання з таблиці."""
+    service = _get_service()
+    rows = _get_all_rows()
+
+    for i, row in enumerate(rows):
+        if not row:
+            continue
+        try:
+            if str(row[COL_ID]) == str(task_id):
+                row_num = i + 2  # +1 заголовок, +1 бо індекс з 0
+                # Отримуємо sheetId для batchUpdate
+                spreadsheet = service.spreadsheets().get(
+                    spreadsheetId=SPREADSHEET_ID
+                ).execute()
+                sheet_id = next(
+                    s["properties"]["sheetId"]
+                    for s in spreadsheet["sheets"]
+                    if s["properties"]["title"] == SHEET_NAME
+                )
+                service.spreadsheets().batchUpdate(
+                    spreadsheetId=SPREADSHEET_ID,
+                    body={"requests": [{
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "ROWS",
+                                "startIndex": row_num - 1,
+                                "endIndex": row_num,
+                            }
+                        }
+                    }]},
+                ).execute()
+                logger.info("Видалено завдання id=%s", task_id)
+                return
+        except (IndexError, ValueError):
+            continue
+
+    logger.warning("Завдання id=%s не знайдено для видалення", task_id)
 
 
 def get_task_by_id(task_id: int | str) -> dict | None:
-    """Повертає завдання за ID або None якщо не знайдено."""
     rows = _get_all_rows()
     for row in rows:
         if not row:
             continue
         try:
             if str(row[COL_ID]) == str(task_id):
-                while len(row) < 8:
-                    row.append("")
-                return {
-                    "id": row[COL_ID],
-                    "created_date": row[COL_DATE],
-                    "project_id": row[COL_PROJECT],
-                    "title": row[COL_TITLE],
-                    "status": row[COL_STATUS],
-                    "source_sender": row[COL_SENDER],
-                    "source_text": row[COL_SOURCE],
-                    "comment": row[COL_COMMENT],
-                }
+                return _row_to_dict(list(row))
         except (IndexError, ValueError):
             continue
     return None
