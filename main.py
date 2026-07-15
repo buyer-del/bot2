@@ -146,9 +146,9 @@ def _build_confirm_queue(analysis: dict) -> list[dict]:
 
 
 def _kb_new_task(payload: dict, projects: list[dict]) -> InlineKeyboardMarkup:
-    proj = payload.get("project_id", "other")
     rows = [
-        [InlineKeyboardButton("✅ Додати завдання", callback_data="nt_accept")],
+        [InlineKeyboardButton("✅ Додати як відкрите", callback_data="nt_accept")],
+        [InlineKeyboardButton("🔄 Додати з оновленим статусом", callback_data="nt_accept_with_status")],
         [InlineKeyboardButton("🔗 Змінити проєкт", callback_data="nt_change_project")],
         [InlineKeyboardButton("❌ Відхилити", callback_data="nt_reject")],
     ]
@@ -356,7 +356,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     payload = item["payload"]
 
-    # --- Нове завдання: прийняти ---
+    # --- Нове завдання: додати як відкрите ---
     if data == "nt_accept":
         storage.add_task(
             title=payload.get("title"),
@@ -366,35 +366,34 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status="відкрито",
         )
         await _remove_old_keyboard(context)
-        await q.message.reply_text(f"✅ Завдання додано: {payload.get('title')}")
-        # Варіант А: одразу питаємо статус
-        task = storage.get_all_tasks()
-        last_task = task[-1] if task else None
-        if last_task:
-            context.user_data["editing_task_id"] = str(last_task["id"])
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="Який статус завдання?",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔵 Відкрито", callback_data=f"set_status_відкрито_{last_task['id']}")],
-                    [InlineKeyboardButton("🟡 В роботі", callback_data=f"set_status_в роботі_{last_task['id']}")],
-                    [InlineKeyboardButton("🟢 Виконано", callback_data=f"set_status_виконано_{last_task['id']}")],
-                    [InlineKeyboardButton("Пропустити", callback_data="status_skip")],
-                ])
-            )
-        else:
-            await _present_next(update, context)
+        await q.message.reply_text(f"✅ Завдання додано як відкрите: {payload.get('title')}")
+        await _present_next(update, context)
+        return
+
+    # --- Нове завдання: додати з вибором статусу ---
+    if data == "nt_accept_with_status":
+        task = storage.add_task(
+            title=payload.get("title"),
+            project_id=payload.get("project_id", "other"),
+            source_text=payload.get("source_text", ""),
+            source_sender=payload.get("source_sender", ""),
+            status="відкрито",
+        )
+        await _remove_old_keyboard(context)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=f"Завдання додано. Обери статус для: {payload.get('title')}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🟡 В роботі", callback_data=f"set_status_в роботі_{task['id']}")],
+                [InlineKeyboardButton("⏸️ Відкладено", callback_data=f"set_status_відкладено_{task['id']}")],
+                [InlineKeyboardButton("🟢 Виконано", callback_data=f"set_status_виконано_{task['id']}")],
+            ])
+        )
         return
 
     if data == "nt_reject":
         await _remove_old_keyboard(context)
         await q.message.reply_text("❌ Відхилено.")
-        await _present_next(update, context)
-        return
-
-    # --- Пропуск вибору статусу після створення завдання ---
-    if data == "status_skip":
-        await _remove_old_keyboard(context)
         await _present_next(update, context)
         return
 
@@ -450,7 +449,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_with_keyboard(context, update.effective_chat.id, text, _kb_new_task(payload, projects))
         return
 
-    # --- Вибір статусу після створення завдання (Варіант А) ---
+    # --- Вибір статусу після створення завдання або з меню ---
     if data.startswith("set_status_"):
         rest = data[len("set_status_"):]
         task_id = rest.split("_")[-1]
@@ -458,7 +457,12 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.to_thread(storage.update_task_status, task_id, new_status)
         await _remove_old_keyboard(context)
         await q.message.reply_text(f"✅ Статус: {new_status}")
-        await _present_next(update, context)
+        # Якщо є активна черга підтверджень — продовжуємо її
+        # Якщо ні — повертаємось до меню
+        if _queue(context) or _pending(context):
+            await _present_next(update, context)
+        else:
+            await _show_main_menu(update.effective_chat.id, context)
         return
 
     # --- Оновлення статусу: підтвердити ---
@@ -658,19 +662,6 @@ async def menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data.startswith("set_status_"):
-        # Формат: set_status_{статус}_{task_id}
-        # Статус може містити пробіл тому розбираємо з кінця
-        rest = data[len("set_status_"):]
-        # task_id — останній елемент після останнього _
-        task_id = rest.split("_")[-1]
-        new_status = rest[:-(len(task_id)+1)]
-        await asyncio.to_thread(storage.update_task_status, task_id, new_status)
-        await _remove_old_keyboard(context)
-        await context.bot.send_message(chat_id=chat_id, text=f"✅ Статус змінено на: {new_status}")
-        await _show_main_menu(chat_id, context)
-        return
-
     # Редагування коментаря
     if data.startswith("task_comment_"):
         task_id = data[len("task_comment_"):]
@@ -795,7 +786,7 @@ def main():
     bot_app.add_handler(CommandHandler("cleardebug", clear_debug_log))
     bot_app.add_handler(MessageHandler(filters.Document.FileExtension("json"), log_document_message))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
-    bot_app.add_handler(CallbackQueryHandler(menu_buttons, pattern="^(wake_up|menu_|task_|set_status_|confirm_delete_|mt_proj_|mt_status_|mt_skip_comment)"))
+    bot_app.add_handler(CallbackQueryHandler(menu_buttons, pattern="^(wake_up|menu_|task_nav_|task_status_|task_comment_|task_delete_|confirm_delete_|mt_proj_|mt_status_|mt_skip_comment)"))
     bot_app.add_handler(CallbackQueryHandler(buttons))
 
     threading.Thread(target=_run_loop_forever, args=(ASYNC_LOOP,), daemon=True).start()
