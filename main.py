@@ -898,7 +898,7 @@ def webhook():
 def main():
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("ping", ping))
-    bot_app.add_handler(CommandHandler("ще", resume_session))
+    bot_app.add_handler(CommandHandler("xxx", resume_session))
     bot_app.add_handler(CommandHandler("debug", debug_log))
     bot_app.add_handler(CommandHandler("cleardebug", clear_debug_log))
     bot_app.add_handler(MessageHandler(filters.Document.FileExtension("json"), log_document_message))
