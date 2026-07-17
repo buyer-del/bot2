@@ -322,3 +322,110 @@ def get_task_by_id(task_id: int | str) -> dict | None:
         except (IndexError, ValueError):
             continue
     return None
+
+
+# ─── Сесія (резервне збереження стану) ──────────────────────────────────────
+
+SESSION_SHEET = "Сесія"
+
+# Колонки листа Сесія
+# A: Етап | B: Вибірка | C: Результат Gemini | D: Черга | E: Звіт | F: Дата логу
+
+
+def _ensure_session_sheet():
+    """Створює лист Сесія якщо його немає."""
+    service = _get_service()
+    spreadsheet = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    sheets = [s["properties"]["title"] for s in spreadsheet["sheets"]]
+    if SESSION_SHEET not in sheets:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"requests": [{"addSheet": {"properties": {"title": SESSION_SHEET}}}]},
+        ).execute()
+        # Заголовок
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SESSION_SHEET}!A1:F1",
+            valueInputOption="RAW",
+            body={"values": [["Етап", "Вибірка", "Результат Gemini", "Черга", "Звіт", "Дата логу"]]},
+        ).execute()
+
+
+def save_session(
+    stage: str,
+    selection: list | None = None,
+    gemini_result: dict | None = None,
+    queue: list | None = None,
+    report_text: str | None = None,
+    log_date: str = "",
+):
+    """
+    Зберігає поточний стан сесії в Google Таблицю (один рядок, перезаписується).
+    stage: 'filtered' | 'analysed' | 'queue' | 'report_pending' | 'report_ready' | 'done'
+    """
+    _ensure_session_sheet()
+    service = _get_service()
+    service.spreadsheets().values().update(
+        spreadsheetId=SPREADSHEET_ID,
+        range=f"{SESSION_SHEET}!A2:F2",
+        valueInputOption="RAW",
+        body={"values": [[
+            stage,
+            json.dumps(selection or [], ensure_ascii=False),
+            json.dumps(gemini_result or {}, ensure_ascii=False),
+            json.dumps(queue or [], ensure_ascii=False),
+            report_text or "",
+            log_date,
+        ]]},
+    ).execute()
+    logger.info("Сесія збережена: етап=%s", stage)
+
+
+def load_session() -> dict | None:
+    """
+    Завантажує збережений стан сесії.
+    Повертає None якщо сесії немає або вона завершена.
+    """
+    try:
+        _ensure_session_sheet()
+        service = _get_service()
+        result = service.spreadsheets().values().get(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SESSION_SHEET}!A2:F2",
+        ).execute()
+        rows = result.get("values", [])
+        if not rows or not rows[0]:
+            return None
+        row = rows[0]
+        while len(row) < 6:
+            row.append("")
+        stage = row[0]
+        if stage == "done" or not stage:
+            return None
+        return {
+            "stage": stage,
+            "selection": json.loads(row[1]) if row[1] else [],
+            "gemini_result": json.loads(row[2]) if row[2] else {},
+            "queue": json.loads(row[3]) if row[3] else [],
+            "report_text": row[4],
+            "log_date": row[5],
+        }
+    except Exception as e:
+        logger.warning("Не вдалось завантажити сесію: %s", e)
+        return None
+
+
+def clear_session():
+    """Очищає стан сесії після успішного завершення."""
+    try:
+        _ensure_session_sheet()
+        service = _get_service()
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"{SESSION_SHEET}!A2:F2",
+            valueInputOption="RAW",
+            body={"values": [["done", "", "", "", "", ""]]},
+        ).execute()
+        logger.info("Сесія очищена")
+    except Exception as e:
+        logger.warning("Не вдалось очистити сесію: %s", e)
