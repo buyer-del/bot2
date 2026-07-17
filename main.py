@@ -20,6 +20,9 @@ from telegram import (
     Update,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application,
@@ -187,9 +190,13 @@ async def _present_next(update_or_chat_id, context: ContextTypes.DEFAULT_TYPE):
         report_date = context.user_data.get("report_date", "")
 
         if report_messages is not None:
+            # Крок 3 завершено: зберігаємо стан перед запитом звіту
+            await asyncio.to_thread(
+                storage.save_session,
+                "report_pending", report_messages, {}, [], None, report_date
+            )
             await context.bot.send_message(chat_id=chat_id, text="✅ Усі пропозиції за сьогодні опрацьовано.\n📝 Складаю звіт за день…")
             try:
-                # Передаємо відкриті завдання для контексту звіту
                 report_tasks = storage.get_open_tasks()
                 report_text = await asyncio.to_thread(
                     generate_report,
@@ -197,14 +204,22 @@ async def _present_next(update_or_chat_id, context: ContextTypes.DEFAULT_TYPE):
                     report_date,
                     report_tasks,
                 )
+                # Крок 4: зберігаємо готовий звіт
+                await asyncio.to_thread(
+                    storage.save_session,
+                    "report_ready", report_messages, {}, [], report_text, report_date
+                )
                 await context.bot.send_message(chat_id=chat_id, text=report_text)
-                # Кнопка прокидайся після звіту
+                # Після надсилання звіту — очищаємо сесію
+                await asyncio.to_thread(storage.clear_session)
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text="Готово. Звіт сформовано.",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("☀️ Прокидайся", callback_data="wake_up")
-                    ]])
+                    reply_markup=ReplyKeyboardMarkup(
+                        [[KeyboardButton("/ще")]],
+                        resize_keyboard=True,
+                        one_time_keyboard=True
+                    )
                 )
             except Exception as e:
                 logger.exception("Помилка генерації звіту: %s", e)
@@ -212,14 +227,28 @@ async def _present_next(update_or_chat_id, context: ContextTypes.DEFAULT_TYPE):
             finally:
                 context.user_data["report_messages"] = None
         else:
+            await asyncio.to_thread(storage.clear_session)
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="✅ Усі пропозиції за сьогодні опрацьовано.",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("☀️ Прокидайся", callback_data="wake_up")
-                ]])
+                reply_markup=ReplyKeyboardMarkup(
+                    [[KeyboardButton("/ще")]],
+                    resize_keyboard=True,
+                    one_time_keyboard=True
+                )
             )
         return
+
+    # Зберігаємо поточний стан черги (Крок 3)
+    await asyncio.to_thread(
+        storage.save_session,
+        "queue",
+        context.user_data.get("report_messages", []),
+        {},
+        queue,
+        None,
+        context.user_data.get("report_date", ""),
+    )
 
     item = queue.pop(0)
     context.user_data["pending_item"] = item
@@ -264,11 +293,87 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /ще — відновлення перерваної сесії."""
+    chat_id = update.effective_chat.id
+    session = await asyncio.to_thread(storage.load_session)
+
+    if not session:
+        await update.message.reply_text(
+            "Незавершених сесій немає.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("☀️ Прокидайся", callback_data="wake_up")
+            ]])
+        )
+        return
+
+    stage = session["stage"]
+
+    if stage == "filtered":
+        # Вибірка є але Gemini ще не викликали
+        await update.message.reply_text("⏳ Відновлюю аналіз дня…")
+        selection = session["selection"]
+        log_date = session["log_date"]
+        projects = load_projects(PROJECTS_FILE) if os.path.exists(PROJECTS_FILE) else storage.get_projects()
+        open_tasks = storage.get_open_tasks()
+        try:
+            analysis = await asyncio.to_thread(analyze_day, selection, projects, open_tasks)
+            queue = _build_confirm_queue(analysis)
+            await asyncio.to_thread(storage.save_session, "queue", selection, analysis, queue, None, log_date)
+            context.user_data["confirm_queue"] = queue
+            context.user_data["report_messages"] = selection
+            context.user_data["report_date"] = log_date
+            n_new = len(analysis.get("new_tasks", []))
+            n_upd = len(analysis.get("task_updates", []))
+            await update.message.reply_text(f"Знайдено: {n_new} нових завдань, {n_upd} оновлень. Продовжую підтвердження…")
+            await _present_next(update, context)
+        except Exception as e:
+            await update.message.reply_text(f"❌ Помилка аналізу: {e}")
+
+    elif stage == "queue":
+        # Черга підтверджень перервалась
+        queue = session["queue"]
+        if not queue:
+            await update.message.reply_text("Черга порожня.")
+            return
+        context.user_data["confirm_queue"] = queue
+        context.user_data["report_messages"] = session["selection"]
+        context.user_data["report_date"] = session["log_date"]
+        await update.message.reply_text(f"⏳ Відновлюю підтвердження. Залишилось: {len(queue)} пунктів.")
+        await _present_next(update, context)
+
+    elif stage == "report_pending":
+        # Черга завершена але звіт ще не сформовано
+        await update.message.reply_text("⏳ Формую звіт…")
+        selection = session["selection"]
+        log_date = session["log_date"]
+        try:
+            report_tasks = storage.get_open_tasks()
+            report_text = await asyncio.to_thread(generate_report, selection, log_date, report_tasks)
+            await asyncio.to_thread(storage.save_session, "report_ready", selection, {}, [], report_text, log_date)
+            await update.message.reply_text(report_text)
+            await asyncio.to_thread(storage.clear_session)
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Готово.",
+                reply_markup=ReplyKeyboardMarkup([[KeyboardButton("/ще")]], resize_keyboard=True, one_time_keyboard=True)
+            )
+        except Exception as e:
+            await update.message.reply_text(f"❌ Помилка формування звіту: {e}")
+
+    elif stage == "report_ready":
+        # Звіт є але не був надісланий
+        await update.message.reply_text(session["report_text"])
+        await asyncio.to_thread(storage.clear_session)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Готово.",
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("/ще")]], resize_keyboard=True, one_time_keyboard=True)
+        )
+
+
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
-
-
-async def debug_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Надсилає файл gemini_debug.log прямо в чат для діагностики."""
     debug_path = os.environ.get("DEBUG_LOG", "gemini_debug.log")
     if not os.path.exists(debug_path):
@@ -317,14 +422,25 @@ async def log_document_message(update: Update, context: ContextTypes.DEFAULT_TYP
             log_data, CONTACTS_FILE, PROJECTS_FILE, open_tasks,
         )
 
+        # Крок 1: зберігаємо відфільтровану вибірку
+        await asyncio.to_thread(
+            storage.save_session,
+            "filtered", selection, None, None, None, log_data.get("export_date", "")
+        )
+
         analysis = await asyncio.to_thread(
             analyze_day,
             selection, projects, open_tasks,
         )
 
+        # Крок 2: зберігаємо результат аналізу Gemini
         queue = _build_confirm_queue(analysis)
-        context.user_data["confirm_queue"] = queue
+        await asyncio.to_thread(
+            storage.save_session,
+            "queue", selection, analysis, queue, None, log_data.get("export_date", "")
+        )
 
+        context.user_data["confirm_queue"] = queue
         context.user_data["report_messages"] = selection
         context.user_data["report_date"] = log_data.get("export_date", "")
 
@@ -782,6 +898,7 @@ def webhook():
 def main():
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("ping", ping))
+    bot_app.add_handler(CommandHandler("ще", resume_session))
     bot_app.add_handler(CommandHandler("debug", debug_log))
     bot_app.add_handler(CommandHandler("cleardebug", clear_debug_log))
     bot_app.add_handler(MessageHandler(filters.Document.FileExtension("json"), log_document_message))
