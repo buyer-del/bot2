@@ -374,6 +374,9 @@ async def resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
+
+
+async def debug_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Надсилає файл gemini_debug.log прямо в чат для діагностики."""
     debug_path = os.environ.get("DEBUG_LOG", "gemini_debug.log")
     if not os.path.exists(debug_path):
