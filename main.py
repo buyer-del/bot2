@@ -216,7 +216,7 @@ async def _present_next(update_or_chat_id, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     text="Готово. Звіт сформовано.",
                     reply_markup=ReplyKeyboardMarkup(
-                        [[KeyboardButton("/ще")]],
+                        [[KeyboardButton("/bag")]],
                         resize_keyboard=True,
                         one_time_keyboard=True
                     )
@@ -232,7 +232,7 @@ async def _present_next(update_or_chat_id, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=chat_id,
                 text="✅ Усі пропозиції за сьогодні опрацьовано.",
                 reply_markup=ReplyKeyboardMarkup(
-                    [[KeyboardButton("/ще")]],
+                    [[KeyboardButton("/bag")]],
                     resize_keyboard=True,
                     one_time_keyboard=True
                 )
@@ -294,7 +294,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /ще — відновлення перерваної сесії."""
+    """Команда /bag — відновлення перерваної сесії."""
     chat_id = update.effective_chat.id
     session = await asyncio.to_thread(storage.load_session)
 
@@ -356,7 +356,7 @@ async def resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat_id,
                 text="Готово.",
-                reply_markup=ReplyKeyboardMarkup([[KeyboardButton("/ще")]], resize_keyboard=True, one_time_keyboard=True)
+                reply_markup=ReplyKeyboardMarkup([[KeyboardButton("/bag")]], resize_keyboard=True, one_time_keyboard=True)
             )
         except Exception as e:
             await update.message.reply_text(f"❌ Помилка формування звіту: {e}")
@@ -368,7 +368,7 @@ async def resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=chat_id,
             text="Готово.",
-            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("/ще")]], resize_keyboard=True, one_time_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("/bag")]], resize_keyboard=True, one_time_keyboard=True)
         )
 
 
@@ -898,7 +898,7 @@ def webhook():
 def main():
     bot_app.add_handler(CommandHandler("start", start))
     bot_app.add_handler(CommandHandler("ping", ping))
-    bot_app.add_handler(CommandHandler("xxx", resume_session))
+    bot_app.add_handler(CommandHandler("bag", resume_session))
     bot_app.add_handler(CommandHandler("debug", debug_log))
     bot_app.add_handler(CommandHandler("cleardebug", clear_debug_log))
     bot_app.add_handler(MessageHandler(filters.Document.FileExtension("json"), log_document_message))
