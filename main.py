@@ -468,6 +468,23 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
     await q.answer()
 
+    # --- Вибір статусу — обробляємо до перевірки pending_item ---
+    # бо може викликатись і з черги підтверджень, і з меню керування завданнями
+    if data.startswith("set_status_"):
+        rest = data[len("set_status_"):]
+        task_id = rest.split("_")[-1]
+        new_status = rest[:-(len(task_id)+1)]
+        await asyncio.to_thread(storage.update_task_status, task_id, new_status)
+        await _remove_old_keyboard(context)
+        await q.message.reply_text(f"✅ Статус: {new_status}")
+        # Якщо є активна черга підтверджень — продовжуємо її
+        # Якщо ні — повертаємось до меню
+        if _queue(context) or _pending(context):
+            await _present_next(update, context)
+        else:
+            await _show_main_menu(update.effective_chat.id, context)
+        return
+
     item = _pending(context)
     if not item:
         await q.message.reply_text("Немає активної пропозиції для підтвердження.")
@@ -566,22 +583,6 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Від: {payload.get('source_sender', '')}"
             )
             await _send_with_keyboard(context, update.effective_chat.id, text, _kb_new_task(payload, projects))
-        return
-
-    # --- Вибір статусу після створення завдання або з меню ---
-    if data.startswith("set_status_"):
-        rest = data[len("set_status_"):]
-        task_id = rest.split("_")[-1]
-        new_status = rest[:-(len(task_id)+1)]
-        await asyncio.to_thread(storage.update_task_status, task_id, new_status)
-        await _remove_old_keyboard(context)
-        await q.message.reply_text(f"✅ Статус: {new_status}")
-        # Якщо є активна черга підтверджень — продовжуємо її
-        # Якщо ні — повертаємось до меню
-        if _queue(context) or _pending(context):
-            await _present_next(update, context)
-        else:
-            await _show_main_menu(update.effective_chat.id, context)
         return
 
     # --- Оновлення статусу: підтвердити ---
