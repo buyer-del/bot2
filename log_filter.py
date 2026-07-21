@@ -3,9 +3,8 @@
 
 Замість двох окремих гілок (А і Б) формує ОДНУ компактну вибірку у форматі JSON:
 - Повідомлення від "особливих" контактів завжди включаються з міткою task_source=true
-- Решта повідомлень проходить двоступеневу фільтрацію:
-  1. Технічний фільтр — відсіює рекламний шум за ознаками відправника/теми
-  2. Embedding-фільтр — відсіює семантично нерелевантні повідомлення
+- Решта повідомлень проходить технічний фільтр — відсіює рекламний шум
+  за ознаками відправника/теми
 - Компактний формат: тільки потрібні поля (час, відправник, текст, чат, мітка)
 
 Термінологія:
@@ -19,9 +18,6 @@ import re
 import logging
 
 logger = logging.getLogger(__name__)
-
-# Порогове значення cosine similarity для embedding-фільтра
-EMBEDDING_THRESHOLD = float(os.environ.get("EMBEDDING_THRESHOLD", "0.25"))
 
 
 # ─── Завантаження довідників ─────────────────────────────────────────────────
@@ -213,49 +209,6 @@ def is_allowed_sender(message: dict, contacts: list[dict]) -> bool:
     return False
 
 
-# ─── Embedding-фільтр ────────────────────────────────────────────────────────
-
-def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    norm_a = sum(x * x for x in a) ** 0.5
-    norm_b = sum(x * x for x in b) ** 0.5
-    if norm_a == 0 or norm_b == 0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-def _get_embeddings(texts: list[str], api_key: str | None = None) -> list[list[float]]:
-    """Отримує embedding-вектори через Gemini text-embedding-004."""
-    from google import genai
-    client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
-    result = client.models.embed_content(
-        model="models/text-embedding-004",
-        contents=texts,
-    )
-    return [e.values for e in result.embeddings]
-
-
-def _is_relevant_by_embedding(
-    text: str,
-    anchor_embeddings: list[list[float]],
-    api_key: str | None = None,
-) -> bool:
-    """
-    Перевіряє чи повідомлення семантично пов'язане з активними проєктами
-    або відкритими завданнями через cosine similarity.
-    """
-    if not anchor_embeddings or not text.strip():
-        return False
-    try:
-        msg_embeddings = _get_embeddings([text], api_key)
-        msg_vec = msg_embeddings[0]
-        max_sim = max(_cosine_similarity(msg_vec, anchor) for anchor in anchor_embeddings)
-        return max_sim >= EMBEDDING_THRESHOLD
-    except Exception as e:
-        logger.warning("Embedding-фільтр: помилка при векторизації: %s", e)
-        return True  # При помилці включаємо повідомлення (безпечніший варіант)
-
-
 # ─── Збір і очищення повідомлень з логу ──────────────────────────────────────
 
 def _collect_raw_messages(log_data: dict) -> list[dict]:
@@ -332,24 +285,15 @@ def build_selection(
         "msg": "текст повідомлення",
         "task_source": true/false  # true = від особливого контакту, шукати нові завдання
     }
+
+    Примітка: параметри projects_path, open_tasks, api_key лишені в сигнатурі
+    для сумісності виклику з main.py (log_document_message, resume_session).
+    Раніше вони використовувались для embedding-фільтра (видалений як
+    неефективний — робив окремий Gemini API-виклик на кожне повідомлення).
+    Зараз фактично не впливають на роботу функції.
     """
     contacts = load_contacts(contacts_path)
-    projects = load_projects(projects_path)
     all_messages = _collect_raw_messages(log_data)
-
-    # Формуємо anchor-тексти для embedding-фільтра:
-    # назви проєктів + тексти відкритих завдань
-    anchor_texts = [p["full_name"] for p in projects if p.get("id") != "other"]
-    if open_tasks:
-        anchor_texts += [t.get("title", "") for t in open_tasks if t.get("title")]
-
-    # Кешуємо anchor-embeddings (один виклик API для всіх anchor-текстів)
-    anchor_embeddings = []
-    if anchor_texts:
-        try:
-            anchor_embeddings = _get_embeddings(anchor_texts, api_key)
-        except Exception as e:
-            logger.warning("Не вдалось отримати anchor-embeddings: %s. Embedding-фільтр вимкнено.", e)
 
     selection = []
     msg_counter = {}  # для унікальності id якщо час однаковий
@@ -385,7 +329,7 @@ def build_selection(
                 "task_source": not m["is_own"],
             })
         elif m["is_own"]:
-            # Власні повідомлення — включаємо без embedding-фільтра але відсіюємо шум
+            # Власні повідомлення — включаємо, але відсіюємо шум
             if not _is_spam(m):
                 selection.append({
                     "id": source_id,
@@ -396,10 +340,8 @@ def build_selection(
                     "task_source": False,
                 })
         else:
-            # Інші відправники — технічний фільтр + embedding-фільтр
+            # Інші відправники — технічний фільтр шуму
             if _is_spam(m):
-                continue
-            if anchor_embeddings and not _is_relevant_by_embedding(text, anchor_embeddings, api_key):
                 continue
             selection.append({
                 "id": source_id,
