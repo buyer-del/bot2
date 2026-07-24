@@ -186,31 +186,31 @@ async def _present_next(update_or_chat_id, context: ContextTypes.DEFAULT_TYPE):
     if not queue:
         context.user_data["pending_item"] = None
 
-        report_messages = context.user_data.get("report_messages")
-        report_date = context.user_data.get("report_date", "")
+        # Читаємо вибірку з сесії — не тримаємо в пам'яті процесу
+        session = await asyncio.to_thread(storage.load_session)
+        report_date = session["log_date"] if session else ""
+        selection = session["selection"] if session else []
 
-        if report_messages is not None:
-            # Крок 3 завершено: зберігаємо стан перед запитом звіту
+        if selection:
             await asyncio.to_thread(
                 storage.save_session,
-                "report_pending", report_messages, {}, [], None, report_date
+                "report_pending", selection, {}, [], None, report_date
             )
             await context.bot.send_message(chat_id=chat_id, text="✅ Усі пропозиції за сьогодні опрацьовано.\n📝 Складаю звіт за день…")
             try:
-                report_tasks = storage.get_open_tasks()
+                report_tasks = await asyncio.to_thread(storage.get_open_tasks)
                 report_text = await asyncio.to_thread(
                     generate_report,
-                    report_messages,
+                    selection,
                     report_date,
                     report_tasks,
                 )
-                # Крок 4: зберігаємо готовий звіт
+                # Крок 4: зберігаємо тільки текст звіту, вибірку не дублюємо
                 await asyncio.to_thread(
                     storage.save_session,
-                    "report_ready", report_messages, {}, [], report_text, report_date
+                    "report_ready", [], {}, [], report_text, report_date
                 )
                 await context.bot.send_message(chat_id=chat_id, text=report_text)
-                # Після надсилання звіту — очищаємо сесію
                 await asyncio.to_thread(storage.clear_session)
                 await context.bot.send_message(
                     chat_id=chat_id,
@@ -224,8 +224,6 @@ async def _present_next(update_or_chat_id, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.exception("Помилка генерації звіту: %s", e)
                 await context.bot.send_message(chat_id=chat_id, text=f"❌ Не вдалося згенерувати звіт: {e}")
-            finally:
-                context.user_data["report_messages"] = None
         else:
             await asyncio.to_thread(storage.clear_session)
             await context.bot.send_message(
@@ -240,15 +238,18 @@ async def _present_next(update_or_chat_id, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Зберігаємо поточний стан черги (Крок 3)
-    await asyncio.to_thread(
-        storage.save_session,
-        "queue",
-        context.user_data.get("report_messages", []),
-        {},
-        queue,
-        None,
-        context.user_data.get("report_date", ""),
-    )
+    # Вибірку не передаємо — вона вже збережена в сесії з Кроку 1-2
+    session = await asyncio.to_thread(storage.load_session)
+    if session:
+        await asyncio.to_thread(
+            storage.save_session,
+            "queue",
+            session.get("selection", []),
+            {},
+            queue,
+            None,
+            session.get("log_date", ""),
+        )
 
     item = queue.pop(0)
     context.user_data["pending_item"] = item
@@ -301,9 +302,7 @@ async def resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not session:
         await update.message.reply_text(
             "Незавершених сесій немає.",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("☀️ Прокидайся", callback_data="wake_up")
-            ]])
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton("/bag")]], resize_keyboard=True, one_time_keyboard=True)
         )
         return
 
@@ -321,8 +320,7 @@ async def resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
             queue = _build_confirm_queue(analysis)
             await asyncio.to_thread(storage.save_session, "queue", selection, analysis, queue, None, log_date)
             context.user_data["confirm_queue"] = queue
-            context.user_data["report_messages"] = selection
-            context.user_data["report_date"] = log_date
+            # Вибірка збережена в сесії — не дублюємо в user_data
             n_new = len(analysis.get("new_tasks", []))
             n_upd = len(analysis.get("task_updates", []))
             await update.message.reply_text(f"Знайдено: {n_new} нових завдань, {n_upd} оновлень. Продовжую підтвердження…")
@@ -337,8 +335,7 @@ async def resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Черга порожня.")
             return
         context.user_data["confirm_queue"] = queue
-        context.user_data["report_messages"] = session["selection"]
-        context.user_data["report_date"] = session["log_date"]
+        # Вибірка береться з сесії при генерації звіту — не в user_data
         await update.message.reply_text(f"⏳ Відновлюю підтвердження. Залишилось: {len(queue)} пунктів.")
         await _present_next(update, context)
 
@@ -444,8 +441,8 @@ async def log_document_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
         context.user_data["confirm_queue"] = queue
-        context.user_data["report_messages"] = selection
-        context.user_data["report_date"] = log_data.get("export_date", "")
+        # Не зберігаємо вибірку в user_data — вона вже є в сесії (Google Таблиця)
+        # Це знижує споживання пам'яті під час підтвердження
 
         n_new = len(analysis.get("new_tasks", []))
         n_upd = len(analysis.get("task_updates", []))
@@ -719,9 +716,7 @@ async def menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Головне меню
-    if data == "menu_back":
-        await _show_main_menu(chat_id, context)
-        return
+
 
     if data == "menu_open":
         tasks = await asyncio.to_thread(storage.get_open_tasks)
@@ -743,6 +738,14 @@ async def menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["task_idx"] = 0
         context.user_data["task_mode"] = "done"
         await _show_task_card(chat_id, context, tasks[0], "done")
+        return
+
+    if data == "menu_back":
+        # Очищаємо task_list з пам'яті при виході з перегляду завдань
+        context.user_data.pop("task_list", None)
+        context.user_data.pop("task_idx", None)
+        context.user_data.pop("task_mode", None)
+        await _show_main_menu(chat_id, context)
         return
 
     if data == "menu_new_task":
