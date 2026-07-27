@@ -60,13 +60,33 @@ def normalize_status(status: str) -> str:
     return STATUS_MAP.get(status.strip().lower(), STATUS_OPEN)
 
 
+# Кешований service-об'єкт (побудований один раз, перевикористовується
+# всіма функціями модуля). Раніше _get_service() будував новий service
+# при КОЖНОМУ виклику (кожне read/write у таблицю) — це створювало
+# постійний потік важких тимчасових об'єктів (парсинг discovery-документа
+# Sheets API) і призводило до поступового росту споживання пам'яті
+# процесу, особливо помітного під час довгого діалогу підтвердження
+# (де на кожен тап кнопки викликалось по кілька storage-функцій).
+#
+# Токен доступу Google оновлюється бібліотекою google-auth автоматично
+# "під капотом" при кожному запиті, незалежно від того, новий це service
+# чи перевикористаний старий — тож кешування тут ніяк не впливає на
+# коректність оновлення доступу.
+_service_cache = None
+
+
 def _get_service():
+    global _service_cache
+    if _service_cache is not None:
+        return _service_cache
+
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if not creds_json:
         raise RuntimeError("GOOGLE_CREDENTIALS_JSON не задано")
     creds_data = json.loads(creds_json)
     creds = Credentials.from_service_account_info(creds_data, scopes=SCOPES)
-    return build("sheets", "v4", credentials=creds)
+    _service_cache = build("sheets", "v4", credentials=creds)
+    return _service_cache
 
 
 def _get_all_rows() -> list[list]:
