@@ -224,10 +224,26 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+# Кешований genai-клієнт — раніше _get_embeddings() створював новий
+# genai.Client() на кожен виклик, а викликається вона окремо для КОЖНОГО
+# повідомлення, що проходить embedding-фільтр (цикл у build_selection).
+# Тобто на один лог могли будуватись десятки/сотні клієнтів поспіль —
+# те саме джерело поступового росту пам'яті, що й у sheets_api.py.
+_genai_client_cache = None
+
+
+def _get_genai_client(api_key: str | None = None):
+    global _genai_client_cache
+    if _genai_client_cache is not None:
+        return _genai_client_cache
+    from google import genai
+    _genai_client_cache = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+    return _genai_client_cache
+
+
 def _get_embeddings(texts: list[str], api_key: str | None = None) -> list[list[float]]:
     """Отримує embedding-вектори через Gemini text-embedding-004."""
-    from google import genai
-    client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+    client = _get_genai_client(api_key)
     result = client.models.embed_content(
         model="models/text-embedding-004",
         contents=texts,
