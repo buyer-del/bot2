@@ -16,6 +16,18 @@ MODEL = "gemini-2.5-flash"
 logger = logging.getLogger(__name__)
 DEBUG_LOG = os.environ.get("DEBUG_LOG", "gemini_debug.log")
 
+# Кешований genai-клієнт (той самий підхід, що й у log_filter.py /
+# task_analyzer.py) — один клієнт на весь модуль.
+_genai_client_cache = None
+
+
+def _get_genai_client(api_key: str | None = None):
+    global _genai_client_cache
+    if _genai_client_cache is not None:
+        return _genai_client_cache
+    _genai_client_cache = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+    return _genai_client_cache
+
 REPORT_SYSTEM_PROMPT = """Твоя задача: На основі наданої переписки та списку завдань скласти короткий щоденний звіт про роботу закупівельника.
 
 Вхідні дані:
@@ -98,7 +110,7 @@ def generate_report(
     log_date — дата з файлу логу (наприклад log_data["export_date"]).
     tasks — список завдань які були відкриті або змінились за день.
     """
-    client = genai.Client(api_key=api_key or os.environ.get("GEMINI_API_KEY"))
+    client = _get_genai_client(api_key)
 
     formatted_messages = _format_selection_for_report(selection)
     formatted_tasks = _format_tasks_for_report(tasks or [])
